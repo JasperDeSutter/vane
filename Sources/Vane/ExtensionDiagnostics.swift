@@ -4,10 +4,9 @@ import WebKit
 /// Folder validation and host limitations, independent of installation consent.
 @MainActor enum ExtensionDiagnostics {
     static let unsupportedAPIs: Set<String> = [
-        "browser.contextMenus", "browser.menus",
         "browser.runtime.sendNativeMessage", "browser.runtime.connectNative"
     ]
-    static let unsupportedPermissions: Set<String> = ["contextMenus", "menus", "nativeMessaging"]
+    static let unsupportedPermissions: Set<String> = ["nativeMessaging"]
 
     static func limitations(_ manifest: [String: Any], extension ext: WKWebExtension) -> [String] {
         let recognized = Set(ext.requestedPermissions.union(ext.optionalPermissions).map(\.rawValue))
@@ -21,8 +20,10 @@ import WebKit
             issues.append("\(permission): Vane does not provide " + (permission == "nativeMessaging"
                 ? "connections to native messaging hosts." : "extension items in page menus."))
         }
+        if !declared.intersection(["contextMenus", "menus"]).isEmpty {
+            issues.append("Page menus are supported; Vane does not yet add extension items to sidebar tab menus.")
+        }
         for (key, detail) in [
-            ("commands", "extension keyboard shortcuts"),
             ("chrome_url_overrides", "replacement browser pages"),
             ("side_panel", "extension side panels"),
             ("devtools_page", "extension developer-tools panels"),
