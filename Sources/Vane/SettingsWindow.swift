@@ -100,6 +100,7 @@ enum LinkTarget {
 /// frame autosave gives "remembers where it was" for free.
 @MainActor enum SettingsWindow {
     private static var window: NSWindow?
+    static let presentationRequest = Notification.Name("VaneSettingsPresentation")
     /// The selected tab, shared by the toolbar (AppKit) and the panes (SwiftUI).
     private static let selection = SettingsSelection()
     private static let tabs = SettingsToolbar(selection)
@@ -108,6 +109,7 @@ enum LinkTarget {
         if let w = window {
             w.makeKeyAndOrderFront(nil)
             NSApp.activate()
+            NotificationCenter.default.post(name: presentationRequest, object: selection.id)
             return
         }
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 560),
@@ -135,24 +137,32 @@ enum LinkTarget {
         // Every `@AppStorage` in this file binds to `UserDefaults.standard` unless told
         // otherwise, which would leave a test instance's Settings toggles in the user's own
         // preferences. `UserDefaults.vane` *is* `.standard` in normal use; see Store.swift.
-        w.contentView = NSHostingView(rootView: SettingsView(selection: selection)
+        let content = NSHostingView(rootView: SettingsView(selection: selection)
             .font(Look.text)
             .defaultAppStorage(.vane))
+        // The window owns its bounds and minimum size. SwiftUI's unconstrained
+        // intrinsic measurement can wrap a pane into thousands of points of height
+        // and enlarge this retained window on a section change.
+        content.sizingOptions = []
+        w.contentView = content
         // Position first, autosave second: setFrameUsingName reports whether there was one.
         if !w.setFrameUsingName("VaneSettings") { w.center() }
         w.setFrameAutosaveName("VaneSettings")
         w.makeKeyAndOrderFront(nil)
         NSApp.activate()
+        NotificationCenter.default.post(name: presentationRequest, object: selection.id)
     }
 
     /// Open straight at one pane — Help ▸ Keyboard Shortcuts, and anything else that means
     /// "the setting you are after is over there".
     static func show(tab: String, profileID: UUID? = nil) {
-        show()
+        // Select before installing or revealing the hosting view. A direct link should
+        // not briefly construct the previous pane (notably the Keychain-backed list).
         if ["passwords", "privacy"].contains(tab) {
             selection.profileID = profileID ?? ProfileManager.shared.active.id
         }
         selection.id = tab
+        show()
     }
 
     /// The title bar names the pane you are looking at, the way Arc's and System Settings'
@@ -277,6 +287,7 @@ private struct SettingsView: View {
                 ScrollView { pane }.id(current.id)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(.windowBackground)
         .toggleStyle(SettingsToggleStyle())
         .controlSize(.small)
