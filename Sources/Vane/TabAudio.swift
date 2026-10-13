@@ -45,6 +45,12 @@ import WebKit
     /// is running; the *decision* is made in Swift, where `check()` can drive it.
     static let script = """
     (function () {
+      // The page can already own the public command name at document end.
+      // Keep installation identity separate, scoped to this Document.
+      var installation = Symbol.for('com.vane.TabAudio.runtime.6387b084-4d20-4a65-9ae6-13898a72aaf5');
+      if (document[installation]) { return; }
+      Object.defineProperty(document, installation, { value: true });
+      var alive = true, queued = false;
       var muted = false, last = null, pending = false, observer = null, timer = null;
       // Live membership covers SPA replacements without searching the whole DOM on
       // every player event. Preserve document order for equally loud audio/video.
@@ -69,6 +75,11 @@ import WebKit
         return best || { playing: false, muted: false, volume: 0, heard: 0 };
       }
       function report() {
+        if (!alive || queued) { return; }
+        queued = true;
+        queueMicrotask(function () { queued = false; if (alive) { reportNow(); } });
+      }
+      function reportNow() {
         var s = loudest(), key = s.playing + '/' + s.muted + '/' + s.volume;
         if (key === last) { return; }      // one message per real change, not per event
         last = key;
@@ -104,8 +115,19 @@ import WebKit
       // true. Until then a subtree observer on every frame of every page was watching for
       // an event nothing would have done anything about; the capture listeners above are
       // what does the reporting, and they cover a player built after load already.
+      window.addEventListener('pagehide', function () {
+        alive = false;
+        if (observer) { observer.disconnect(); observer = null; }
+        if (timer !== null) { clearTimeout(timer); timer = null; }
+        pending = false;
+      });
+      window.addEventListener('pageshow', function () {
+        alive = true; last = null;
+        if (muted) { window.__vaneMute(true); }
+        else { report(); }
+      });
       function watch() {
-        if (observer) { return; }
+        if (!alive || observer) { return; }
         function containsMedia(node) {
           return node.nodeType === 1 &&
             (node.matches('video,audio') || !!node.querySelector('video,audio'));
