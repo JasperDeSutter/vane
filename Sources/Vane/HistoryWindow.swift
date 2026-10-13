@@ -12,6 +12,8 @@ import SwiftUI
 /// refreshed by cancellable searches and committed history-change notifications.
 @MainActor enum HistoryWindow {
     private static var window: NSWindow?
+    private static var profileID: UUID?
+    static let refresh = Notification.Name("vane.feel05.historyRefresh")
 
     static func showWriteFailure(_ store: Store) {
         let alert = NSAlert()
@@ -25,8 +27,13 @@ import SwiftUI
 
     static func show(profileID: UUID = Windows.current?.profileID ?? ProfileManager.activeProfileID) {
         if let w = window {
-            w.contentView = SecondaryWindowStyle.host(HistoryView(profileID: profileID)
-                .font(Look.text), minimumSize: NSSize(width: 520, height: 360))
+            if Self.profileID != profileID || w.contentView == nil {
+                w.contentView = SecondaryWindowStyle.host(HistoryView(profileID: profileID)
+                    .font(Look.text), minimumSize: NSSize(width: 520, height: 360))
+                Self.profileID = profileID
+            } else {
+                NotificationCenter.default.post(name: refresh, object: profileID)
+            }
             w.title = profileID == Profile.incognito.id ? "History — Incognito" : "History"
             w.appearance = profileID == Profile.incognito.id ? NSAppearance(named: .darkAqua) : nil
             w.makeKeyAndOrderFront(nil)
@@ -41,6 +48,7 @@ import SwiftUI
         SecondaryWindowStyle.apply(to: w)
         w.isReleasedWhenClosed = false        // closing must not free the instance we keep
         window = w
+        Self.profileID = profileID
         w.contentView = SecondaryWindowStyle.host(HistoryView(profileID: profileID)
             .font(Look.text), minimumSize: NSSize(width: 520, height: 360))
         // Position first, autosave second: setFrameUsingName reports whether there was one.
@@ -80,6 +88,8 @@ private struct HistoryView: View {
     @State private var query = ""
     @State private var visits: [Visit] = []
     @State private var groups: [(title: String, visits: [Visit])] = []
+    @State private var resultGate = Feel05ResultGate<Request>()
+    private var rowsAreCurrent: Bool { resultGate.isCurrent(request, refreshing: searching) }
     @State private var searching = true
     @State private var selection: Visit.ID?
     @State private var hovered: Visit.ID?
@@ -115,12 +125,13 @@ private struct HistoryView: View {
         .foregroundStyle(Look.inkPrimary)
         .background(Look.panelFill)
         .onAppear { focus = .search }
-        .onChange(of: query) { clearResults() }
+        .onChange(of: query) { searching = true }
         .onChange(of: selectedProfileID) { clearResults() }
-        .onChange(of: period) { clearResults() }
+        .onChange(of: period) { searching = true }
         .task(id: request) {
             guard profileID != Profile.incognito.id else { clearResults(); searching = false; return }
             let asked = request
+            searching = true
             if !query.isEmpty {
                 try? await Task.sleep(for: LocalSuggestionReader.debounce)
             }
@@ -131,10 +142,19 @@ private struct HistoryView: View {
             visits = results
             groups = asked.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? HistoryWindow.grouped(results) : (results.isEmpty ? [] : [("Results", results)])
+            resultGate.present(asked)
             searching = false
             if let selected = selection, !results.contains(where: { $0.id == selected }) {
                 selection = nil
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: HistoryWindow.refresh)) { note in
+            if let requested = note.object as? UUID, requested != selectedProfileID {
+                clearResults()
+                selectedProfileID = requested
+            }
+            reload()
+            focus = .search
         }
         .onReceive(NotificationCenter.default.publisher(for: Store.historyChanged)) { note in
             if note.object as? Store === store { reload() }
@@ -162,9 +182,9 @@ private struct HistoryView: View {
                 .fixedSize()
             }
             Spacer()
-            Text("\(visits.count)\(visits.count == Self.limit ? "+" : "") visits")
+            Text(searching ? "Updating history…" : "\(visits.count)\(visits.count == Self.limit ? "+" : "") visits")
                 .font(Look.caption).monospacedDigit().foregroundStyle(Look.inkSecondary)
-                .accessibilityLabel("Showing \(visits.count) visits")
+                .accessibilityLabel(searching ? "Updating history" : "Showing \(visits.count) visits")
         }
     }
 
@@ -237,7 +257,7 @@ private struct HistoryView: View {
                 if direction == .down { moveSelection(1) }
             }
             .onKeyPress(.return) {
-                guard let visit = visits.first(where: { $0.id == selection }) else { return .ignored }
+                guard rowsAreCurrent, let visit = visits.first(where: { $0.id == selection }) else { return .ignored }
                 open(visit)
                 return .handled
             }
@@ -293,6 +313,7 @@ private struct HistoryView: View {
         .accessibilityAddTraits(.isButton)
         .accessibilityHint("Opens this page in a new tab.")
         .accessibilityAction { open(visit) }
+        .disabled(!rowsAreCurrent)
     }
 
     // MARK: Doing things
@@ -307,6 +328,7 @@ private struct HistoryView: View {
     /// front. A history window you are working through is a list you are still reading, and
     /// keeping it key is also what leaves ⌫ pointed at the row you just clicked.
     private func open(_ visit: Visit) {
+        guard rowsAreCurrent else { return }
         selection = visit.id
         focus = .list
         guard let url = URL(string: visit.url) else { return }
@@ -315,14 +337,16 @@ private struct HistoryView: View {
     }
 
     private func delete(_ visit: Visit) {
-        guard store.deleteVisit(visit.id) else { HistoryWindow.showWriteFailure(store); return }
-        if selection == visit.id { selection = nil }
-        reload()
-        axAnnounce("Forgot \(visit.display).")
+        resultGate.performIfCurrent(request, refreshing: searching) {
+            guard store.deleteVisit(visit.id) else { HistoryWindow.showWriteFailure(store); return }
+            if selection == visit.id { selection = nil }
+            reload()
+            axAnnounce("Forgot \(visit.display).")
+        }
     }
 
     private func moveSelection(_ delta: Int) {
-        guard !visits.isEmpty else { return }
+        guard rowsAreCurrent, !visits.isEmpty else { return }
         let current = visits.firstIndex { $0.id == selection } ?? (delta > 0 ? -1 : visits.count)
         let next = max(0, min(visits.count - 1, current + delta))
         selection = visits[next].id
