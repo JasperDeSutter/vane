@@ -56,8 +56,11 @@ struct SpaceChromeTheme: Equatable {
     var hovered: Color { Look.hovered }
     var selected: Color { Look.selected }
     var selectedEdge: Color { primary == nil ? Look.selectedEdge : tone(0.62).opacity(0.65) }
-    // Floating hints keep a dark, opaque surface for predictable contrast over pages.
-    var bubble: Color { tone(0.08, saturation: 0.65) }
+    // Darken the primary proportionally: lighter spaces retain a visible tint,
+    // while the darkest endpoint reaches black without a fixed brightness floor.
+    var bubble: Color {
+        tone((primary?.hsl.l ?? 0.32) * 0.25, saturation: 0.65)
+    }
     var bubbleHint: Color { tone(0.80, saturation: 0.35) }
     var bubbleHover: Color { Color.white.opacity(0.14) }
 }
