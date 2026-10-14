@@ -214,13 +214,16 @@ final class WebHost: NSView {
         // page out of the window used to leave it, only without the trip through nobody.
         // Only when the page being left is the one that actually holds it: a first
         // responder anywhere else in the window — the address pill, the find field — is
-        // somebody's on purpose and a switch must not pull it into the page. Deferred a
-        // turn, the way `TabStore.focusPage` is, so the hand-off happens after AppKit has
-        // finished with this pass and not in the middle of it.
+        // somebody's on purpose and a switch must not pull it into the page. Release it
+        // before hiding: AppKit otherwise searches the whole SwiftUI key-view tree
+        // synchronously while the Space's rows are being replaced. Focus the arriving
+        // page next turn, after this rendering pass has finished.
         if let window, let outgoing, outgoing !== next,
            let holder = window.firstResponder as? NSView, holder.isDescendant(of: outgoing) {
-            DispatchQueue.main.async { [weak next] in
-                guard let next, next.window === window else { return }
+            window.makeFirstResponder(nil)
+            DispatchQueue.main.async { [weak self, weak next] in
+                guard let self, let next, self.web === next, !next.isHidden,
+                      next.window === window else { return }
                 window.makeFirstResponder(next)
             }
         }
@@ -447,12 +450,12 @@ struct BrowserWindow: View {
         .onChange(of: store.libraryOpen) { if store.libraryOpen { spaceCount = profiles.allSpaces.count } }
         // The page slides over as the panel takes its width, and back when it gives it up —
         // including when the Spaces section widens the panel to fit another card.
-        .animation(reduceMotion || batterySaver.isActive ? nil : Look.appear, value: libraryWidth)
+        .animation(reduceMotion || batterySaver.isActive ? nil : Look.librarySlide, value: libraryWidth)
         .animation(reduceMotion || batterySaver.isActive ? nil : .easeOut(duration: 0.2),
                    value: store.sidebarShown)
         .animation(reduceMotion || batterySaver.isActive ? nil
                    : Look.floatingSidebarAnimation, value: peeking)
-        .animation(reduceMotion || batterySaver.isActive ? nil : Look.appear, value: store.libraryOpen)
+        .animation(reduceMotion || batterySaver.isActive ? nil : Look.librarySlide, value: store.libraryOpen)
         .animation(reduceMotion || batterySaver.isActive ? nil : Look.appear, value: store.palette == nil)
         // Arc hides the traffic lights along with the sidebar: a collapsed window is the
         // page and nothing else. They come back the moment either sidebar does.
@@ -577,7 +580,7 @@ struct SpaceGround: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let here = store.swipeSpace
+        let here = gesture.outgoing?.space ?? store.swipeSpace
         let systemDark = here?.appearance == nil ? scheme == .dark
             : NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
         let mine = surface(of: here, systemDark: systemDark)
@@ -585,7 +588,8 @@ struct SpaceGround: View {
         let wash = mine.mixed(towards: pull.surface, fraction: pull.fraction)
         ZStack {
             if store.isPrivate { Color(hex: Profile.incognito.colorHex) }
-            ThemeWashView(wash: wash)
+            NativeThemeWash(wash: wash, reduced: reduceMotion, gesture: gesture,
+                            origin: mine, destination: pull.surface)
         }
         // Gesture transactions already own the travel and cancellation timing. Only a
         // direct Space change or a theme edit needs a local animation.
@@ -634,8 +638,9 @@ struct SpaceGround: View {
     private func pulled(from here: Space?, systemDark: Bool) -> (surface: ThemeWash, fraction: Double) {
         let idle = (surface(of: here, systemDark: systemDark), 0.0)
         let width = SidebarWidth.shared.width
-        guard gesture.drag != 0, width > 0, let target = gesture.neighbour else { return idle }
-        return (surface(of: target, systemDark: systemDark), Double(min(1, abs(gesture.drag / width))))
+        let drag = gesture.nativeDrag ?? gesture.drag
+        guard drag != 0, width > 0, let target = gesture.neighbour else { return idle }
+        return (surface(of: target, systemDark: systemDark), Double(min(1, abs(drag / width))))
     }
 }
 
@@ -2797,6 +2802,7 @@ private struct SpaceIcons: View {
 private struct SpaceDots: View {
     @Environment(\.spaceChromeTheme) private var chromeTheme
     let layout: SpaceStripLayout
+    @ObservedObject var footer: SpaceFooterProgress
     @EnvironmentObject var store: TabStore
     @EnvironmentObject private var gesture: SpaceGesture
     /// *Which* dot's panel is open, not merely whether one is. Every dot draws its own
@@ -2920,8 +2926,9 @@ private struct SpaceDots: View {
     private func weights(_ list: [Space]) -> [UUID: Double] {
         guard let current = store.currentSpaceID, list.contains(where: { $0.id == current }) else { return [:] }
         let width = SidebarWidth.shared.width
-        guard gesture.drag != 0, width > 0, let target = gesture.neighbour else { return [current: 1] }
-        let f = Double(min(1, abs(gesture.drag / width)))
+        let drag = footer.drag ?? gesture.drag
+        guard drag != 0, width > 0, let target = gesture.neighbour else { return [current: 1] }
+        let f = Double(min(1, abs(drag / width)))
         return SpaceDotBlend.weights(current: current, target: target.id, fraction: f)
     }
 }
@@ -2969,7 +2976,8 @@ struct SpaceSectionsLayout<Header: View, Rows: View>: View {
         VStack(spacing: Look.rowGap) {
             header()
             ScrollView {
-                VStack(spacing: Look.rowGap) { rows() }
+                // Both the live sidebar and moving previews mount only the viewport.
+                LazyVStack(spacing: Look.rowGap) { rows() }
                     .frame(minHeight: scrollHeight, alignment: .top)
                     .background(WindowDragArea())
             }
@@ -3068,7 +3076,7 @@ private struct PinnedSection: View {
         // of this list and takes a drop as one; the space row above; ⌘⇧D; or New Folder.
         let rows = store.pinnedSectionCollapsed ? [] : available
         if !available.isEmpty {
-            VStack(spacing: Look.rowGap) {
+            LazyVStack(spacing: Look.rowGap) {
                 ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                     ShapeRow(row: row.visible, tab: row.tab, index: index, rows: rows.count,
                              shape: \.pins, pr: presentation(of: row.visible))
@@ -3750,7 +3758,7 @@ private struct OpenTabs: View {
         // actually draw a row are counted — a pane that is not its split's lead, and an
         // entry whose tab has gone, draw nothing. See `PinnedSection`.
         let rows = snapshot.rows
-        VStack(spacing: Look.rowGap) {
+        LazyVStack(spacing: Look.rowGap) {
             ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                 ShapeRow(row: row.visible, tab: row.tab, index: index, rows: rows.count, shape: \.todayShape)
                     .transition(.todayRow)
@@ -5001,7 +5009,7 @@ struct BottomRow: View {
                     let layout = SpaceStripLayout(count: count, availableWidth: geometry.size.width)
                     ScrollViewReader { proxy in
                         ScrollView(.horizontal) {
-                            SpaceDots(layout: layout)
+                            SpaceDots(layout: layout, footer: gesture.footer)
                                 .frame(minWidth: geometry.size.width)
                         }
                         .scrollIndicators(.never)

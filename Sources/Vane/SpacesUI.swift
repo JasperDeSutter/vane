@@ -2,11 +2,23 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// Native finger tracking only republishes the small footer, not sidebar lists or tint.
+@MainActor final class SpaceFooterProgress: ObservableObject {
+    @Published var drag: CGFloat?
+}
+
 /// Only the sliding sections, tint and footer track these per-frame gesture values.
 /// Publishing them on TabStore would invalidate the entire browser on every scroll event.
 @MainActor final class SpaceGesture: ObservableObject {
     let monitor = SwipeMonitor()
     @Published var drag: CGFloat = 0
+    /// While native surfaces follow the fingers, keep raw input out of SwiftUI publication.
+    let footer = SpaceFooterProgress()
+    var nativeDrag: CGFloat? {
+        didSet { if footer.drag != nativeDrag { footer.drag = nativeDrag } }
+    }
+    var trackGround: ((Double) -> Void)?
+    var colourDuration = Look.spaceSlideDuration
     @Published var pull: CGFloat = 0
     @Published var swiping = false
     @Published var travelsFavorites = false
@@ -21,6 +33,7 @@ import UniformTypeIdentifiers
     /// SwiftUI anchor can disappear while a floating sidebar is hidden.
     weak var scrollingFooter: NSView?
     weak var stripView: NSView?
+    weak var sectionsView: NSView?
     weak var outgoingView: NSView?
     @Published var profileSliding = false
     @Published var profileSlidesFavorites = false
@@ -40,7 +53,7 @@ import UniformTypeIdentifiers
 
 extension Look {
     /// Keep the existing sidebar travel; page selection happens at its quarter point.
-    static let spaceSlideDuration: TimeInterval = 0.16
+    static let spaceSlideDuration: TimeInterval = 0.24
     static let spaceSlide = Animation.easeIn(duration: spaceSlideDuration)
     /// The strip finishing a swipe: the rest of the travel after the fingers leave, and the
     /// spring back when they did not go far enough. A spring rather than an ease because the
@@ -49,7 +62,7 @@ extension Look {
     static let spaceSpring = Animation.spring(response: 0.35, dampingFraction: 0.85)
     /// A committed swipe reaches rest before handing the preview to the live sidebar.
     /// A finite ease keeps focus prompt without cutting off a spring's visible tail.
-    static let spaceLandingDuration: TimeInterval = 0.08
+    static let spaceLandingDuration: TimeInterval = 0.18
     static let spaceLanding = Animation.easeIn(duration: spaceLandingDuration)
     /// Returning from a canceled drag keeps its gentler timing.
     static let spaceReturn = Animation.spring(response: 0.16, dampingFraction: 0.9)
@@ -318,6 +331,7 @@ struct SpaceSidebarStrip<Favorites: View, Sections: View>: View {
                         .accessibilityHidden(true)
                 }
             }
+            .background(SpaceStripAnchor(gesture: gesture, moving: false, sectionsOnly: true))
             .opacity(gesture.profileSliding ? 0 : 1)
         }
         .background(SpaceStripAnchor(gesture: gesture, moving: false))
@@ -363,10 +377,12 @@ struct SpaceSidebarStrip<Favorites: View, Sections: View>: View {
 private struct SpaceStripAnchor: NSViewRepresentable {
     let gesture: SpaceGesture
     let moving: Bool
+    var sectionsOnly = false
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         view.wantsLayer = true
         if moving { gesture.outgoingView = view }
+        else if sectionsOnly { gesture.sectionsView = view }
         else { gesture.stripView = view }
         return view
     }
@@ -558,7 +574,7 @@ struct SpacePreviewList: View, Equatable {
                 .padding(.bottom, pinnedCollapsed || !pinnedAvailable ? 0 : Look.sectionGap / 2 - Look.rowGap)
             } rows: {
                 if pinnedAvailable {
-                    VStack(spacing: Look.rowGap) {
+                    LazyVStack(spacing: Look.rowGap) {
                         ForEach(Array(rows.pinned.enumerated()), id: \.offset) { _, entry in
                             row(entry, selected: isSelected(entry))
                         }
@@ -567,7 +583,7 @@ struct SpacePreviewList: View, Equatable {
                 }
                 tidy
                 newTab
-                VStack(spacing: Look.rowGap) {
+                LazyVStack(spacing: Look.rowGap) {
                     ForEach(Array(rows.today.enumerated()), id: \.offset) { _, entry in
                         row(entry, selected: isSelected(entry))
                     }
@@ -1021,6 +1037,15 @@ private struct SpaceSwipe: ViewModifier {
             rebuild()
             return
         }
+        // The native track mounts both surfaces before starting its animation clock.
+        // It does not need the SwiftUI ghost's extra preparation below.
+        let anchor = target.profileID == store.profileID
+            ? store.spaceGesture.sectionsView : store.spaceGesture.stripView
+        if store.window?.contentView is BrowserWindowHost, anchor != nil {
+            land(direction, to: target, width: SidebarWidth.shared.width, store: store,
+                 animation: Look.spaceSlide, activationDelay: Look.spaceSlideDuration / 4)
+            return
+        }
         // Mount the preview offscreen before animating it into place. In the same update
         // as its insertion, SwiftUI would draw it at the final offset and skip the travel.
         let from = store.currentSpaceID
@@ -1142,8 +1167,7 @@ private struct SpaceSwipe: ViewModifier {
                 return nil
             }
             if let offset = out.offset {
-                store.spaceSwiping = true
-                store.spaceDrag = offset             // straight on, no animation: it is the fingers
+                self.track(offset, width: width, in: store)
             }
             store.spacePull = out.pull
             if let direction = out.commit {
@@ -1210,6 +1234,7 @@ private struct SpaceSwipe: ViewModifier {
         // Several teardown notifications can arrive for the same window. A committed
         // landing keeps ownership until its completion, even after the monitor is removed.
         guard let store, !landing, store.spaceDrag != 0 || store.spaceSwiping else { return }
+        (store.window?.contentView as? BrowserWindowHost)?.cancelSpaceSlide()
         store.spaceDrag = 0
         store.spacePull = 0
         store.spaceSwiping = false
@@ -1221,6 +1246,47 @@ private struct SpaceSwipe: ViewModifier {
         if event.phase.contains(.cancelled) { return .cancelled }
         if event.phase.contains(.ended) { return .ended }
         return .changed
+    }
+
+    /// Mount once when the gesture acquires a neighbour, then follow scroll deltas without
+    /// asking SwiftUI to render a translated list for every event.
+    func track(_ offset: CGFloat, width: CGFloat, in store: TabStore) {
+        guard width > 0 else { return }
+        store.spaceSwiping = true
+        if offset == 0, let slide = (store.window?.contentView as? BrowserWindowHost)?.spaceSlide,
+           slide.isSource(store) {
+            store.spaceGesture.nativeDrag = 0
+            slide.track(drag: 0)
+            store.spaceGesture.trackGround?(0)
+            return
+        }
+        let target = store.swipeNeighbour(for: offset)
+        let direction = offset < 0 ? 1 : -1
+        if let target, !Motion.spaceReduced,
+           let slide = (store.window?.contentView as? BrowserWindowHost)?.spaceSlide,
+           slide.follows(target, direction: direction) {
+            store.spaceGesture.nativeDrag = offset
+            slide.track(drag: offset)
+            store.spaceGesture.trackGround?(Double(min(1, abs(offset / width))))
+            return
+        }
+        store.spaceGesture.nativeDrag = nil
+        if target == nil { (store.window?.contentView as? BrowserWindowHost)?.cancelSpaceSlide() }
+        store.spaceDrag = offset
+        guard target != nil, !Motion.spaceReduced,
+              let host = store.window?.contentView as? BrowserWindowHost,
+              let target = store.spaceGesture.neighbour,
+              let origin = store.spaceGesture.outgoing?.space else { return }
+        let includesFavorites = target.profileID != store.profileID
+        guard let anchor = includesFavorites ? store.spaceGesture.stripView : store.spaceGesture.sectionsView else { return }
+        let slide = ProfileSpaceSlide(frame: anchor.convert(anchor.bounds, to: host),
+            outgoing: store.swipePreview(in: origin, includingFavorites: includesFavorites),
+            incoming: store.swipePreview(in: target), drag: offset, direction: direction,
+            source: store, includesFavorites: includesFavorites, travelWidth: width)
+        host.beginSpaceSlide(slide)
+        slide.prepare()
+        slide.track(drag: offset)
+        store.spaceGesture.nativeDrag = offset
     }
 
     /// Keep the sidebar moving continuously; activate the page at one quarter of travel time.
@@ -1243,6 +1309,8 @@ private struct SpaceSwipe: ViewModifier {
         landing = true
         landingFrom = store.currentSpaceID
         let destination = store.spaceGesture.neighbour ?? target
+        store.spaceGesture.colourDuration = activationDelay * 4
+        store.spaceGesture.nativeDrag = nil
         let includesFavorites = destination.profileID != store.profileID
         let finish: () -> Void = { [weak self, weak store] in
             guard let self, self.transition == token, let store else { return }
@@ -1258,20 +1326,25 @@ private struct SpaceSwipe: ViewModifier {
             }
             rebuild()
         }
-        if includesFavorites, let host = store.window?.contentView as? BrowserWindowHost,
-           let anchor = store.spaceGesture.stripView,
+        if let host = store.window?.contentView as? BrowserWindowHost,
+           let anchor = (includesFavorites ? store.spaceGesture.stripView : store.spaceGesture.sectionsView),
            let origin = store.spaceGesture.outgoing?.space ?? store.swipeSpace {
             let frame = anchor.convert(anchor.bounds, to: host)
             let presentationOffset = store.spaceGesture.outgoingView?.layer?.presentation().map {
                 $0.convert(.zero, to: host.layer?.presentation()).x - frame.minX
             }
             let drag = host.spaceSlide?.offset ?? presentationOffset ?? store.spaceDrag
-            let slide = ProfileSpaceSlide(frame: frame,
-                outgoing: store.swipePreview(in: origin, includingFavorites: true),
-                incoming: store.swipePreview(in: destination), drag: drag,
-                direction: direction, source: store, includesFavorites: includesFavorites,
-                travelWidth: width)
-            host.beginSpaceSlide(slide)
+            let slide: ProfileSpaceSlide
+            if let tracking = host.spaceSlide, tracking.follows(destination, direction: direction) {
+                slide = tracking
+            } else {
+                slide = ProfileSpaceSlide(frame: frame,
+                    outgoing: store.swipePreview(in: origin, includingFavorites: includesFavorites),
+                    incoming: store.swipePreview(in: destination), drag: drag,
+                    direction: direction, source: store, includesFavorites: includesFavorites,
+                    travelWidth: width)
+                host.beginSpaceSlide(slide)
+            }
             Motion.space(animation) { store.spaceGesture.drag = -CGFloat(direction) * width }
             slide.start(duration: activationDelay * 4, completion: finish)
             scheduleActivation(in: store, after: activationDelay)
@@ -1281,7 +1354,7 @@ private struct SpaceSwipe: ViewModifier {
                 store.spaceGesture.drag = slide.offset
                 host.cancelSpaceSlide()
             }
-            // Within a profile retain the existing finger-following SwiftUI track.
+            // Keep the SwiftUI track when no native sidebar surface is mounted.
             scheduleActivation(in: store, after: activationDelay)
             Motion.space(animation) { store.spaceGesture.drag = -CGFloat(direction) * width }
             DispatchQueue.main.asyncAfter(deadline: .now() + activationDelay * 4) { [weak store] in
@@ -1316,6 +1389,18 @@ private struct SpaceSwipe: ViewModifier {
             return
         }
         returning = true
+        store.spaceGesture.colourDuration = 0.16
+        store.spaceGesture.nativeDrag = nil
+        if let slide = (store.window?.contentView as? BrowserWindowHost)?.spaceSlide,
+           slide.isSource(store) {
+            Motion.space(Look.spaceReturn) { store.spaceGesture.drag = 0 }
+            slide.start(duration: 0.16, returning: true) { [weak self, weak store] in
+                guard let self, self.transition == token else { return }
+                self.returning = false
+                store?.spaceSwiping = false
+            }
+            return
+        }
         Motion.space(Look.spaceReturn) { store.spaceGesture.drag = 0 } completion: { [weak store] in
             guard self.transition == token else { return }
             self.returning = false
