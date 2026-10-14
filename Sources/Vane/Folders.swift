@@ -81,6 +81,10 @@ struct Pins: Codable, Equatable, Sendable {
         /// folder that appears *earlier* in the array, which is what makes every walk up
         /// the parent chain terminate.
         var parent: UUID?
+        /// A new live row previewed until its folder is opened. Stored on the entry so
+        /// duplicate URLs keep their own arrival state through save and restoration.
+        /// Optional keeps shapes saved before arrival previews decodable.
+        var liveArrival: Bool? = nil
 
         var id: String {
             switch row {
@@ -186,7 +190,7 @@ struct Pins: Codable, Equatable, Sendable {
         var id: String { entry.id }
     }
 
-    /// What the sidebar draws: everything with no folded-up folder above it.
+    /// What the sidebar draws: unfolded rows and arrivals previewed by collapsed live folders.
     var visible: [Visible] { visible(unlocked: []) }
 
     func visible(unlocked: Set<UUID>) -> [Visible] {
@@ -195,7 +199,15 @@ struct Pins: Codable, Equatable, Sendable {
         while i < entries.count {
             out.append(Visible(entry: entries[i], depth: depth(of: i)))
             if let f = entries[i].folder, f.collapsed || (f.requiresAuthentication == true && !unlocked.contains(f.id)) {
-                i = subtree(at: i).upperBound          // skip what it is hiding
+                let end = subtree(at: i).upperBound
+                if f.collapsed, f.live != nil,
+                   f.requiresAuthentication != true || unlocked.contains(f.id) {
+                    for child in (i + 1)..<end where entries[child].parent == f.id {
+                        guard entries[child].tab != nil, entries[child].liveArrival == true else { continue }
+                        out.append(Visible(entry: entries[child], depth: depth(of: child)))
+                    }
+                }
+                i = end
             } else {
                 i += 1
             }
@@ -225,6 +237,7 @@ struct Pins: Codable, Equatable, Sendable {
         }
 
         var moved = Array(entries[range])
+        if moved[0].parent != parent { moved[0].liveArrival = nil }
         moved[0].parent = parent       // the rows under it still point at folders inside it
         entries.removeSubrange(range)
         var at = raw
@@ -368,6 +381,11 @@ struct Pins: Codable, Equatable, Sendable {
     mutating func edit(folder id: UUID, _ change: (inout Folder) -> Void) {
         guard let i = index(of: id), var f = entries[i].folder else { return }
         change(&f)
+        if !f.collapsed || f.live == nil {
+            for child in entries.indices where entries[child].parent == id {
+                entries[child].liveArrival = nil
+            }
+        }
         entries[i].row = .folder(f)
     }
 
@@ -432,7 +450,9 @@ struct Pins: Codable, Equatable, Sendable {
             case .folder: out.entries.append(entry)
             case .tab(let t):
                 guard let renamed = name(t) else { continue }
-                out.entries.append(Entry(row: .tab(renamed), parent: entry.parent))
+                var translated = entry
+                translated.row = .tab(renamed)
+                out.entries.append(translated)
             }
         }
         return out

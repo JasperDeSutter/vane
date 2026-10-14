@@ -1570,6 +1570,16 @@ extension TabStore {
                 }
                 previous = id
             }
+            // The rows already belong to the folder. Expose only the new arrivals while
+            // it stays folded, retaining row identity and the usual list animation.
+            if pins.folder(folder)?.collapsed == true {
+                let arrivals = Set(plan.add.compactMap { byURL[$0]?.uuidString })
+                for index in pins.entries.indices where pins.entries[index].parent == folder {
+                    if arrivals.contains(pins.entries[index].id) {
+                        pins.entries[index].liveArrival = true
+                    }
+                }
+            }
             applyOrder(.pinned)
         }
         savePins()
