@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import CryptoKit
 import WebKit
 
 @MainActor protocol FavouritePreviewLoading: AnyObject {
@@ -23,6 +24,7 @@ import WebKit
     private var context: FavouritePreviewContext?
     private let loader: any FavouritePreviewLoading
     private let observeSessions: Bool
+    private let sessionObserverFactory: (UUID, FavouritePreviews) -> FavouriteSessionObserver
     private let now: @MainActor () -> Date
     private var cache = FavouritePreviewCache()
     private var attempts: [FavouritePreviewContext: Date] = [:]
@@ -32,6 +34,8 @@ import WebKit
     private var generation = 0
     private var sessionRetries = 0
     private var loading = false
+    private var loadingOwner: UUID?
+    private var backgroundLoad = false
     private var preparing = false
     private var preparedState: FavouritePreviewState?
     private var promotionTask: Task<Void, Never>?
@@ -46,8 +50,27 @@ import WebKit
         start(context, owner: owner, source: source, privateSession: privateSession, preparation: true)
     }
 
-    init(loader: any FavouritePreviewLoading, observeSessions: Bool = false, now: @escaping @MainActor () -> Date = { .now }) {
+    init(loader: any FavouritePreviewLoading, observeSessions: Bool = false, now: @escaping @MainActor () -> Date = { .now },
+         sessionObserverFactory: @escaping (UUID, FavouritePreviews) -> FavouriteSessionObserver = { FavouriteSessionObserver(profileID: $0, previews: $1) }) {
         self.loader = loader; self.observeSessions = observeSessions; self.now = now
+        self.sessionObserverFactory = sessionObserverFactory
+    }
+
+    /// Shares the foreground loader and cache. Never interrupts a user intent or
+    /// wakes a parked tab; its hidden page is released by the normal load deadline.
+    func warm(_ context: FavouritePreviewContext, source: WKWebView? = nil) async {
+        guard owner == nil, !loading, !backgroundLoad, Self.enabled(context.service),
+              !BatterySaver.shared.isActive, source?.isLoading != true else { return }
+        start(context, owner: UUID(), source: source, preparation: true, background: true)
+        let ticket = generation
+        await task?.value
+        // A foreground request may have adopted this work while it was in flight.
+        if generation == ticket, backgroundLoad { stop(); self.context = nil }
+    }
+
+    func cancelWarmup() {
+        guard backgroundLoad else { return }
+        stop(); context = nil
     }
 
     func request(_ context: FavouritePreviewContext, owner: UUID, account: String? = nil,
@@ -58,19 +81,25 @@ import WebKit
 
     private func start(_ context: FavouritePreviewContext, owner: UUID, account: String? = nil,
                        source: WKWebView? = nil, privateSession: Bool = false,
-                       sessionRetries: Int = 0, preparation: Bool) {
-        if task != nil, self.context == context, self.owner == owner, accountHint == account,
+                       sessionRetries: Int = 0, preparation: Bool, background: Bool = false) {
+        if task != nil, self.context == context,
+           (self.owner == owner || (self.owner == nil && (backgroundLoad || (loading && loadingOwner == owner)))), accountHint == account,
            self.sessionRetries == sessionRetries,
            requestSource === source, Self.enabled(context.service), !privateSession,
            blocked[context.profileID] == nil {
+            // A quick return reattaches to the already-started, bounded request.
+            if self.owner == nil {
+                self.owner = owner; backgroundLoad = false; loadingOwner = owner; preparing = preparing || preparation; state = .loading
+            }
             // A promotion must not restart WebKit or consume the failed-refresh cooldown.
             if !preparation && preparing { promote(context, source: source) }
             return
         }
         stop()
+        backgroundLoad = background
         preparing = preparation; accountHint = account; requestSource = source
         self.sessionRetries = sessionRetries
-        self.owner = owner; self.context = context; state = .loading
+        self.owner = background ? nil : owner; self.context = context; state = .loading
         guard Self.enabled(context.service), !privateSession, blocked[context.profileID] == nil else {
             state = .unavailable; return
         }
@@ -78,11 +107,16 @@ import WebKit
             state = .unavailable; return
         }
         if observeSessions, observers[context.profileID] == nil {
-            observers[context.profileID] = FavouriteSessionObserver(profileID: context.profileID, previews: self)
+            observers[context.profileID] = sessionObserverFactory(context.profileID, self)
         }
         let ticket = generation
         task = Task(priority: preparation ? .background : .utility) { [weak self, weak source] in
             guard let self else { return }
+            // Establish the session baseline before the hidden page can write cookies.
+            let session = await self.observers[context.profileID]?.synchronize()
+            guard !Task.isCancelled, self.generation == ticket else { return }
+            // Speculative work is useful only for an already authenticated session.
+            if self.backgroundLoad && self.observeSessions && session?.hasAuthentication(for: context.service) != true { return }
             var identity = account
             let liveProof = source?.url.flatMap { FavouritePreviewContext(profileID: context.profileID, url: $0) } == context
             // The live favourite supplies account proof before any cached data is displayed.
@@ -94,23 +128,29 @@ import WebKit
             guard !Task.isCancelled, self.generation == ticket,
                   Self.enabled(context.service), self.blocked[context.profileID] == nil else { return }
             let hit = identity.flatMap { self.cache.lookup(context: context, account: $0, now: self.now()) }
+                ?? (identity == nil && !liveProof ? session.flatMap { self.cache.lookup(context: context, session: $0, now: self.now()) } : nil)
             if let hit, !hit.stale { self.setState(.ready(hit.snapshot)); return }
             if let hit { self.setState(.stale(hit.snapshot)) }
             if let last = self.attempts[context], self.now().timeIntervalSince(last) < 30 {
                 if hit == nil { self.setState(.unavailable) }
                 return
             }
-            // Bound failed refreshes as well as successes. No timer refreshes a closed card.
+            // Bound failed refreshes as well as successes, including background warmups.
             self.attempts[context] = self.now()
             if self.attempts.count > 48, let oldest = self.attempts.min(by: { $0.value < $1.value })?.key {
                 self.attempts[oldest] = nil
             }
-            self.loading = true
-            let result = await self.loader.load(context)
-            guard !Task.isCancelled, self.generation == ticket, self.owner == owner,
+            self.loading = true; self.loadingOwner = self.owner ?? owner
+            var result = FavouritePreviewResult.unavailable
+            if liveProof, let source, !source.isLoading {
+                result = await FavouriteIdentityProbe.extraction(source, service: context.service)
+                guard !Task.isCancelled, self.generation == ticket else { return }
+            }
+            if result == .unavailable { result = await self.loader.load(context) }
+            guard !Task.isCancelled, self.generation == ticket,
                   Self.enabled(context.service), self.blocked[context.profileID] == nil else { return }
             // Verification is still in-flight work: cancellation here must permit a retry.
-            defer { if self.generation == ticket { self.loading = false } }
+            defer { if self.generation == ticket { self.loading = false; self.loadingOwner = nil } }
             switch result {
             case .ready(let snapshot):
                 // Account proof can change while WebKit is loading. Recheck a source
@@ -130,7 +170,16 @@ import WebKit
                     self.cache.invalidate(profileID: context.profileID)
                     self.setState(.unavailable); return
                 }
-                self.cache.store(snapshot, context: context, now: self.now())
+                // Recheck the cookie proof after loading, including notifications that
+                // WebKit may have coalesced, before attaching it to a cached account.
+                let currentSession = await self.observers[context.profileID]?.synchronize()
+                guard !Task.isCancelled, self.generation == ticket else { return }
+                guard currentSession == session else {
+                    self.cache.invalidate(profileID: context.profileID)
+                    self.setState(.unavailable)
+                    return
+                }
+                self.cache.store(snapshot, context: context, now: self.now(), session: session)
                 self.setState(.ready(snapshot))
             case .signedOut:
                 self.cache.invalidate(profileID: context.profileID)
@@ -143,6 +192,13 @@ import WebKit
 
     func dismiss(owner: UUID) {
         guard self.owner == owner else { return }
+        if loading && !BatterySaver.shared.isActive {
+            // Let this one user-initiated request fill the cache. The loader's existing
+            // deadline still retires WebKit; no closed-card refresh or polling begins.
+            self.owner = nil; state = .loading; preparing = false; preparedState = nil
+            promotionTask?.cancel(); promotionTask = nil
+            return
+        }
         stop(); self.owner = nil; context = nil; state = .loading
     }
     func invalidate(profileID: UUID) {
@@ -157,7 +213,8 @@ import WebKit
     func sessionChanged(profileID: UUID) {
         cache.invalidate(profileID: profileID)
         attempts = attempts.filter { $0.key.profileID != profileID }
-        guard let context, context.profileID == profileID, let owner else { return }
+        guard let context, context.profileID == profileID else { return }
+        guard let owner else { stop(); return }
         if loading && !preparing && sessionRetries < 1 {
             request(context, owner: owner, account: accountHint, source: requestSource,
                     sessionRetries: sessionRetries + 1)
@@ -186,7 +243,7 @@ import WebKit
     private func stop() {
         // Cancellation is not a failed refresh. A deliberate return may retry immediately.
         if loading, let context { attempts[context] = nil }
-        generation += 1; task?.cancel(); task = nil; loading = false; loader.cancel()
+        generation += 1; task?.cancel(); task = nil; loading = false; loadingOwner = nil; backgroundLoad = false; loader.cancel()
         preparing = false; preparedState = nil; accountHint = nil; requestSource = nil
         promotionTask?.cancel(); promotionTask = nil
     }
@@ -199,16 +256,20 @@ import WebKit
         case .ready(let value), .stale(let value): snapshot = value
         default: setState(prepared); return
         }
-        // Never expose a cache hit with account proof collected during the earlier dwell.
-        guard let source else { setState(prepared); return }
+        // Proof collected during the earlier dwell must still hold when the card opens.
+        if source == nil && !observeSessions { setState(prepared); return }
         let ticket = generation
         promotionTask = Task { [weak self, weak source] in
             guard !Task.isCancelled, let self, self.generation == ticket else { return }
-            guard let source else { self.setState(.unavailable); return }
-            let identity = await FavouriteIdentityProbe.read(source, script: DOMFavouritePreviewAdapter(service: context.service).identityScript)
+            let verified: Bool
+            if let source, source.url.flatMap({ FavouritePreviewContext(profileID: context.profileID, url: $0) }) == context {
+                let identity = await FavouriteIdentityProbe.read(source, script: DOMFavouritePreviewAdapter(service: context.service).identityScript)
+                verified = source.url.flatMap({ FavouritePreviewContext(profileID: context.profileID, url: $0) }) == context && identity == snapshot.account
+            } else if let session = await self.observers[context.profileID]?.synchronize() {
+                verified = self.cache.lookup(context: context, session: session, now: self.now())?.snapshot.account == snapshot.account
+            } else { verified = false }
             guard !Task.isCancelled, self.generation == ticket else { return }
-            guard source.url.flatMap({ FavouritePreviewContext(profileID: context.profileID, url: $0) }) == context,
-                  identity == snapshot.account else {
+            guard verified else {
                 self.stop(); self.cache.invalidate(profileID: context.profileID)
                 self.setState(.unavailable); return
             }
@@ -216,28 +277,91 @@ import WebKit
             if self.state == .loading { self.setState(prepared) }
         }
     }
+
     private func setState(_ state: FavouritePreviewState) {
+        if backgroundLoad { preparedState = state; return }
+        guard owner != nil else { return }
         if preparing { preparedState = state; return }
         Motion.animate(Look.quick) { self.state = state }
     }
 }
 
-@MainActor private final class FavouriteSessionObserver: NSObject, WKHTTPCookieStoreObserver {
+/// Ignore page/analytics cookie churn. Keep only in-memory digests of authentication
+/// cookies; sign-out, deletion and account replacement still invalidate all cached data.
+struct FavouriteSessionFingerprint: Equatable {
+    private struct Cookie: Hashable {
+        let domain, path, name: String
+        let digest: Data
+    }
+    private var cookies: Set<Cookie>
+    func hasAuthentication(for service: FavouritePreviewService) -> Bool {
+        cookies.contains { cookie in
+            if service == .github {
+                return cookie.domain == "github.com" && ["user_session", "__Host-user_session_same_site"].contains(cookie.name)
+            }
+            return cookie.domain != "github.com" && ["SID", "LSID", "__Secure-1PSID", "__Secure-3PSID"].contains(cookie.name)
+        }
+    }
+    init(_ cookies: [HTTPCookie]) {
+        self.cookies = Set(cookies.compactMap { cookie in
+            let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            let names: Set<String>
+            if domain == "github.com" {
+                names = ["user_session", "__Host-user_session_same_site", "logged_in", "dotcom_user"]
+            } else if ["google.com", "accounts.google.com", "mail.google.com", "calendar.google.com"].contains(domain) {
+                names = ["SID", "HSID", "SSID", "APISID", "SAPISID", "LSID", "__Host-GAPS", "ACCOUNT_CHOOSER", "MULTILOGIN", "multi_login",
+                         "__Secure-1PSID", "__Secure-3PSID", "__Secure-1PAPISID", "__Secure-3PAPISID"]
+            } else { return nil }
+            guard names.contains(cookie.name) else { return nil }
+            return Cookie(domain: domain, path: cookie.path, name: cookie.name,
+                          digest: Data(SHA256.hash(data: Data(cookie.value.utf8))))
+        })
+    }
+}
+
+@MainActor final class FavouriteSessionObserver: NSObject, WKHTTPCookieStoreObserver {
     let profileID: UUID
     weak var previews: FavouritePreviews?
     let store: WKHTTPCookieStore
-    init(profileID: UUID, previews: FavouritePreviews) {
+    private var fingerprint: FavouriteSessionFingerprint?
+    private var update: Task<Void, Never>?
+    private var dirty = false
+    init(profileID: UUID, previews: FavouritePreviews, store: WKHTTPCookieStore? = nil) {
         self.profileID = profileID; self.previews = previews
-        store = ProfileManager.dataStore(for: profileID).httpCookieStore
-        super.init(); store.add(self)
+        self.store = store ?? ProfileManager.dataStore(for: profileID).httpCookieStore
+        super.init(); self.store.add(self)
+        refresh()
     }
     nonisolated func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
-        Task { @MainActor [weak self] in
+        Task { @MainActor [weak self] in self?.refresh() }
+    }
+    func refresh() {
+        dirty = true
+        guard update == nil else { return }
+        // Serialize/coalesce reads so an older callback cannot overwrite newer proof.
+        update = Task { @MainActor [weak self] in
             guard let self else { return }
-            previews?.sessionChanged(profileID: profileID)
+            while dirty && !Task.isCancelled {
+                dirty = false
+                let values = await withCheckedContinuation { continuation in
+                    store.getAllCookies { continuation.resume(returning: $0) }
+                }
+                let next = FavouriteSessionFingerprint(values)
+                guard !Task.isCancelled else { return }
+                let changed = fingerprint.map { $0 != next } ?? false
+                fingerprint = next
+                if changed { previews?.sessionChanged(profileID: profileID) }
+            }
+            update = nil
         }
     }
-    func detach() { store.remove(self) }
+    func ready() async { await update?.value }
+    func synchronize() async -> FavouriteSessionFingerprint? {
+        refresh()
+        await ready()
+        return fingerprint
+    }
+    func detach() { store.remove(self); update?.cancel(); update = nil }
 }
 
 @MainActor private final class FavouriteIdentityProbe {
@@ -247,6 +371,12 @@ import WebKit
         guard let continuation else { return }
         self.continuation = nil; timeout?.cancel(); timeout = nil
         continuation.resume(returning: value?.isEmpty == false ? value : nil)
+    }
+    static func extraction(_ web: WKWebView, service: FavouritePreviewService) async -> FavouritePreviewResult {
+        let adapter = DOMFavouritePreviewAdapter(service: service)
+        guard let raw = await read(web, script: "JSON.stringify(\(adapter.script))"),
+              let value = try? JSONDecoder().decode(FavouritePreviewExtraction.self, from: Data(raw.utf8)) else { return .unavailable }
+        return adapter.parse(value)
     }
     static func read(_ web: WKWebView, script: String) async -> String? {
         let probe = FavouriteIdentityProbe()

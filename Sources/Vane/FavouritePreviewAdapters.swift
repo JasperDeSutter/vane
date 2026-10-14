@@ -8,6 +8,7 @@ struct FavouritePreviewExtraction: Codable, Sendable {
         var unread: Bool = false
         var status: String? = nil
         var timeLabel: String? = nil
+        var snippet: String? = nil
         var start: String? = nil
         var meeting: String? = nil
     }
@@ -30,7 +31,7 @@ struct DOMFavouritePreviewAdapter: FavouritePreviewAdapter {
     func parse(_ extraction: FavouritePreviewExtraction) -> FavouritePreviewResult {
         if extraction.state == "signedOut" { return .signedOut }
         let account = extraction.account.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !account.isEmpty, account.count <= 254, extraction.items.count <= 5,
+        guard !account.isEmpty, account.count <= 254, extraction.items.count <= 50,
               extraction.state == "ready" || extraction.state == "empty" else { return .unavailable }
         guard extraction.state == "empty" ? extraction.items.isEmpty : !extraction.items.isEmpty else { return .unavailable }
         var items: [FavouritePreviewItem] = []
@@ -40,8 +41,14 @@ struct DOMFavouritePreviewAdapter: FavouritePreviewAdapter {
                   let url = FavouritePreviewURL.item(row.url, service: service) else { return .unavailable }
             guard service != .gmail || !row.subtitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .unavailable }
             var item = FavouritePreviewItem(title: row.title, subtitle: row.subtitle, url: url, unread: row.unread)
-            if service == .gmail { item.timeLabel = row.timeLabel.map { String($0.prefix(40)) } }
-            if service == .github { item.status = row.status.map { String($0.prefix(160)) } }
+            if service == .gmail {
+                item.timeLabel = row.timeLabel.map { String($0.prefix(40)) }
+                item.snippet = row.snippet.map { String($0.prefix(300)).trimmingCharacters(in: .whitespacesAndNewlines) }
+            }
+            if service == .github {
+                item.status = row.status.map { String($0.prefix(160)) }
+                item.timeLabel = row.timeLabel.map { String($0.prefix(40)) }
+            }
             if service == .calendar {
                 guard let start = row.start, let date = ISO8601DateFormatter().date(from: start) else { return .unavailable }
                 item.startsAt = date
@@ -79,6 +86,16 @@ struct DOMFavouritePreviewAdapter: FavouritePreviewAdapter {
           return unknown();
         }
         const text = el => (el?.textContent || '').trim().replace(/\\s+/g,' ');
+        const age = el => {
+          const raw = (el?.getAttribute('datetime') || el?.getAttribute('title') || '').replace(/\\s+/g,' ');
+          const date = Date.parse(raw), seconds = Math.floor((Date.now() - date) / 1000);
+          if (!Number.isFinite(date) || seconds < 0) return text(el);
+          if (seconds < 60) return 'now';
+          if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
+          if (seconds < 86400) return Math.floor(seconds / 3600) + 'h';
+          if (seconds < 604800) return Math.floor(seconds / 86400) + 'd';
+          return text(el);
+        };
         const result = (state, items=[]) => ({state,account,items});
         const visible = el => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
         \(extractionBody)
@@ -94,7 +111,7 @@ struct DOMFavouritePreviewAdapter: FavouritePreviewAdapter {
             const query = new URL(location.href).searchParams.get('q') || '';
             if (!['/pulls','/pulls/search'].includes(location.pathname) || !/(^|\s)involves:@me(?=\s|$)/.test(query) || !/(^|\s)(is|state):open(?=\s|$)/.test(query)) return unknown();
             const modern = Array.from(document.querySelectorAll('a[data-testid="listitem-title-link"][href*="/pull/"]')).map(a => a.closest('li')).filter(Boolean);
-            const rows = Array.from(new Set([...document.querySelectorAll('.js-issue-row'), ...modern])).filter(visible).slice(0,5);
+            const rows = Array.from(new Set([...document.querySelectorAll('.js-issue-row'), ...modern])).filter(visible).slice(0,50);
             if (!rows.length) {
               const empty = Array.from(document.querySelectorAll('.blankslate, [data-testid="results-empty-state"]'))
                 .some(el => /no (results|pull requests)|nothing matched/i.test(text(el)));
@@ -110,7 +127,7 @@ struct DOMFavouritePreviewAdapter: FavouritePreviewAdapter {
               const badgeLabel = badge?.getAttribute('aria-label') || text(badge);
               if (badgeLabel && !labels.includes(badgeLabel)) labels.push(badgeLabel);
               return {title:text(link), subtitle:url ? url.pathname.split('/').slice(1,3).join('/') : '',
-                url:url?.href || '', unread:false, status:labels.slice(0,2).join(' · ') || null};
+                url:url?.href || '', unread:false, timeLabel:age(row.querySelector('relative-time[datetime], time[datetime]')) || null, status:labels.slice(0,2).join(' · ') || null};
             });
             return result('ready',items);
             """#
@@ -119,7 +136,7 @@ struct DOMFavouritePreviewAdapter: FavouritePreviewAdapter {
             if (!location.pathname.startsWith('/mail/') || !location.hash.startsWith('#inbox')) return unknown();
             const main = document.querySelector('[role="main"]');
             if (!main) return unknown();
-            const rows = Array.from(main.querySelectorAll('tr.zA')).filter(visible).slice(0,5);
+            const rows = Array.from(main.querySelectorAll('tr.zA')).filter(visible).slice(0,50);
             if (!rows.length) {
               const empty = Array.from(main.querySelectorAll('td, [role="status"]'))
                 .some(el => /^(Your inbox is empty\.?|No new mail!?|No conversations in Inbox\.?)$/i.test(text(el)));
@@ -135,7 +152,8 @@ struct DOMFavouritePreviewAdapter: FavouritePreviewAdapter {
                 const target = new URL(location.href); target.hash = 'inbox/' + id; url = target.href;
               }
               return {title:text(subject), subtitle:sender?.getAttribute('name') || text(sender) || sender?.getAttribute('email') || '',
-                url, unread:row.classList.contains('zE'), timeLabel:text(row.querySelector('.xW [title], .xW')) || null};
+                url, snippet:text(row.querySelector('.y2')).replace(/^[-–—]\s*/, '').slice(0,300) || null,
+                unread:row.classList.contains('zE'), timeLabel:age(row.querySelector('.xW [title]') || row.querySelector('.xW')) || null};
             });
             return result('ready',items);
             """#
@@ -161,7 +179,7 @@ struct DOMFavouritePreviewAdapter: FavouritePreviewAdapter {
                 unread:false, start:new Date(start).toISOString().replace(/\.\d{3}Z$/,'Z'), meeting:meeting?.href || null});
             }
             items.sort((a,b) => Date.parse(a.start) - Date.parse(b.start));
-            if (items.length) return result('ready',items.slice(0,5));
+            if (items.length) return result('ready',items.slice(0,50));
             // A short virtualized window is not proof that the upcoming calendar is empty.
             return unknown();
             """#
