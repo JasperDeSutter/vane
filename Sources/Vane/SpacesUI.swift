@@ -105,9 +105,7 @@ struct SpaceName: View {
             store.switchTo(space: space); rebuild()
         }
     } + [ChromeMenuItem(title: "New Space", symbol: "rectangle.stack.badge.plus", startsGroup: true) {
-        store.newSpace(); rebuild()
-    }, ChromeMenuItem(title: "New Space from Template…", symbol: "rectangle.stack") {
-        store.showWorkspaceTemplates()
+        store.beginCreatingSpace(); rebuild()
     }]
     anchor.show(items, title: "Spaces")
 }
@@ -125,7 +123,7 @@ struct NewSpaceButton: View {
         Button {
             let shortcut = Keybindings.binding(for: .newTab)
             menuAnchor.show([
-                ChromeMenuItem(title: "New Space", symbol: "rectangle.stack.badge.plus") { store.newSpace() },
+                ChromeMenuItem(title: "New Space", symbol: "rectangle.stack.badge.plus") { store.beginCreatingSpace() },
                 ChromeMenuItem(title: "New Folder", symbol: "folder") { store.newFolder() },
                 ChromeMenuItem(title: "New Easel", symbol: "scribble.variable",
                                shortcut: Keybindings.binding(for: .newEasel).display,
@@ -138,10 +136,6 @@ struct NewSpaceButton: View {
                 },
                 ChromeMenuItem(title: "New Tab", symbol: "plus.square",
                                shortcut: shortcut == .unassigned ? "" : shortcut.display) { store.newTab(nil) },
-                ChromeMenuItem(title: "New Space from Template…", symbol: "rectangle.stack",
-                               startsGroup: true) {
-                    store.showWorkspaceTemplates()
-                },
             ], above: true, title: "Create", showsPointer: true)
         } label: {
             Image(systemName: "plus")
@@ -1176,10 +1170,7 @@ private struct SpaceSwipe: ViewModifier {
     /// The plus is full: the form takes the sidebar, and the strip, which only banded,
     /// goes home underneath it. Nothing is made yet — Create Space is a button.
     private func create(_ store: TabStore) {
-        Motion.space(Look.spaceSlide) {
-            store.spacePull = 0
-            store.creatingSpace = true
-        }
+        store.beginCreatingSpace()
         settle(store)
     }
 
@@ -1431,6 +1422,17 @@ struct CreateSpaceForm: View {
             .buttonStyle(.borderedProminent)
             .keyboardShortcut(.defaultAction)
             .disabled(cleaned == nil)
+            Button {
+                store.showWorkspaceTemplates(for: chosenProfile.id, creatingSpace: true, creationName: cleaned)
+            } label: {
+                Label("Use Template", systemImage: "rectangle.stack")
+                    .font(Look.text)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: Look.rowHeight)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(TactileButtonStyle())
+            .foregroundStyle(Look.inkSecondary)
             Button("Cancel") { store.cancelCreatingSpace() }
                 .buttonStyle(.plain)
                 .foregroundStyle(Look.inkSecondary)
