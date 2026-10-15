@@ -837,18 +837,64 @@ extension VaneWindow {
     private var current: ObjectIdentifier?
     private var subscription: AnyCancellable?
     private(set) var spaceSlide: ProfileSpaceSlide?
+    private var queuedSpaceSelection: (slide: ProfileSpaceSlide, target: Space)?
+    private var queueRevision = UUID()
 
-    func beginSpaceSlide(_ slide: ProfileSpaceSlide) {
+    func clearQueuedSpaceSelection() {
+        queuedSpaceSelection = nil
+        queueRevision = UUID()
+    }
+
+    func queueSpaceSelection(_ target: Space, after slide: ProfileSpaceSlide) {
+        clearQueuedSpaceSelection()
+        queuedSpaceSelection = (slide, target)
+    }
+
+    func takeQueuedSpaceSelection() -> Space? {
+        let target = queuedSpaceSelection?.target
+        clearQueuedSpaceSelection()
+        return target
+    }
+
+    func beginSpaceSlide(_ slide: ProfileSpaceSlide, preservingGround: Bool = false) {
+        // Capture before cancel resolves the old selection's final wash. The replacement
+        // sidebar continues its presentation, so its background must continue it too.
+        let ground = preservingGround ? spaceSlide.flatMap { $0.isActive ? $0.captureGroundPresentation() : nil } : nil
         cancelSpaceSlide()
+        slide.groundStart = ground
         spaceSlide = slide
-        addSubview(slide)
+        // Idle surfaces are already above the live host. Re-adding one detaches its
+        // backing layer until AppKit's next display turn, leaving hidden live rows blank.
+        if slide.superview !== self {
+            addSubview(slide)
+            // A cold insertion has no committed backing hierarchy yet. Complete that
+            // AppKit display pass before track/start transfers visibility from live rows.
+            if slide.layer?.superlayer !== layer { window?.displayIfNeeded() }
+        }
     }
 
     func didFinishSpaceSlide(_ slide: ProfileSpaceSlide) {
-        if spaceSlide === slide { spaceSlide = nil }
+        guard spaceSlide === slide else { return }
+        spaceSlide = nil
+        guard let queued = queuedSpaceSelection, queued.slide === slide else { return }
+        queuedSpaceSelection = nil
+        let revision = queueRevision
+        let arrivedID = slide.completedSpaceID
+        let window = window
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window, self.window === window, self.queueRevision == revision,
+                  self.spaceSlide == nil,
+                  let arriving = TabStore.all.first(where: { $0.window === window }),
+                  arriving.currentSpaceID == arrivedID, !arriving.libraryOpen,
+                  arriving.sidebarShown || arriving.sidebarPeeking else { return }
+            // The visible destination has reached rest and its live rows are drawn.
+            // Revalidate the last requested Space through the arriving profile's monitor.
+            arriving.spaceGesture.monitor.select(queued.target, in: arriving)
+        }
     }
 
     func cancelSpaceSlide() {
+        clearQueuedSpaceSelection()
         spaceSlide?.cancel()
         spaceSlide = nil
     }
@@ -886,21 +932,31 @@ extension VaneWindow {
 }
 
 /// Keep the same two sidebar surfaces on a native track from finger movement through
-/// landing, including when the page or profile host changes at the quarter point.
+/// landing, including page selection underneath it and a profile host handoff.
 @MainActor final class ProfileSpaceSlide: NSView {
     let outgoing: NSView
     private let incoming: NSView
     private let direction: Int
     private let targetID: UUID
+    private let preparedOrigin: Space
+    private let preparedTarget: Space
+    private let preparedFrame: NSRect
     private weak var source: TabStore?
     private weak var destination: TabStore?
     private var finished = false
+    private var completingSelection = false
     private let includesFavorites: Bool
     private let travelWidth: CGFloat
     private let contentInset: CGFloat
     private var completion: (() -> Void)?
     private var lastTracking: (offset: CGFloat, time: TimeInterval)?
     private var trackingVelocity: CGFloat = 0
+    private var progressLink: CADisplayLink?
+    private weak var retirementStore: TabStore?
+    private var retirementSpaceID: UUID?
+    private var retirementScheduled = false
+    private var retirementTimeout: DispatchWorkItem?
+    private var sidebarAcknowledgements: [ObjectIdentifier: (spaceID: UUID?, atRest: Bool)] = [:]
     var offset: CGFloat { (outgoing.layer?.presentation()?.frame.minX ?? outgoing.frame.minX) - contentInset }
     private var motionObserver: NSObjectProtocol?
 
@@ -920,6 +976,9 @@ extension VaneWindow {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading))
         self.direction = direction
         targetID = incoming.space.id
+        preparedOrigin = outgoing.space
+        preparedTarget = incoming.space
+        preparedFrame = frame
         self.includesFavorites = includesFavorites
         self.travelWidth = travelWidth
         contentInset = max(0, (travelWidth - frame.width) / 2)
@@ -945,11 +1004,18 @@ extension VaneWindow {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
+    /// A completed cover can remain mounted for presentation handoff. Its identity is
+    /// still useful for cleanup, but it must never reacquire input or animation ownership.
+    var isActive: Bool { !finished }
+    private var restingSpaceID: UUID?
+    fileprivate var completedSpaceID: UUID { restingSpaceID ?? targetID }
     func isDestination(_ store: TabStore) -> Bool { destination === store }
     func isSource(_ store: TabStore) -> Bool { source === store }
 
     func attach(_ store: TabStore) {
-        guard !finished else { return }
+        // Profile activation occurs inside finish's completion. It still owns this
+        // overlay until the arriving sidebar is attached and acknowledged.
+        guard !finished || completingSelection else { return }
         destination = store
         store.spaceGesture.profileSlidesFavorites = includesFavorites
         store.spaceGesture.profileSliding = true
@@ -959,8 +1025,14 @@ extension VaneWindow {
         !finished && targetID == target.id && self.direction == direction
     }
 
+    func preparedFor(origin: Space, target: Space, frame: NSRect, width: CGFloat) -> Bool {
+        !finished && preparedOrigin == origin && preparedTarget == target
+            && preparedFrame == frame && travelWidth == width
+    }
+
     /// Finger tracking changes only layer positions; the two hosted lists are laid out once.
     func track(drag: CGFloat) {
+        guard isActive else { return }
         let now = ProcessInfo.processInfo.systemUptime
         if let previous = lastTracking {
             let dt = now - previous.time
@@ -984,8 +1056,21 @@ extension VaneWindow {
         incoming.layoutSubtreeIfNeeded()
     }
 
+    fileprivate var groundStart: ThemeWashPresentation?
+    fileprivate func captureGroundPresentation() -> ThemeWashPresentation? { source?.spaceGesture.captureGround?() }
+    private var finishGround: ((Space?) -> Void)?
+    private var animationID: UUID?
+
     func start(duration: TimeInterval, returning: Bool = false, completion: @escaping () -> Void) {
+        guard isActive else { return }
         self.completion = completion
+        restingSpaceID = returning ? preparedOrigin.id : targetID
+        let animationID = UUID()
+        self.animationID = animationID
+        let presentedGround = groundStart ?? (finishGround != nil ? captureGroundPresentation() : nil)
+        groundStart = nil
+        sidebarAcknowledgements.removeAll()
+        publishProgress(offset)
         source?.spaceGesture.profileSlidesFavorites = includesFavorites
         source?.spaceGesture.profileSliding = true
         prepare()
@@ -1006,7 +1091,10 @@ extension VaneWindow {
         CATransaction.begin()
         CATransaction.setAnimationDuration(duration)
         CATransaction.setCompletionBlock { [weak self] in
-            MainActor.assumeIsolated { self?.finish() }
+            MainActor.assumeIsolated {
+                guard let self, self.animationID == animationID else { return }
+                self.finish()
+            }
         }
         for (layer, from) in [(outgoingLayer, fromOutgoing), (incomingLayer, fromIncoming)] {
             let animation: CABasicAnimation
@@ -1024,33 +1112,163 @@ extension VaneWindow {
             } else {
                 animation = CABasicAnimation(keyPath: "position")
                 animation.duration = duration
-                animation.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                let distance = layer.position.x - from.x
+                let fresh = lastTracking.map { ProcessInfo.processInfo.systemUptime - $0.time < 0.1 } ?? false
+                if fresh, distance != 0 {
+                    // Cubic Hermite travel: leave with the finger's velocity and arrive
+                    // with zero velocity. Bounded controls keep even a flick monotonic.
+                    let slope = max(0, min(3, trackingVelocity * duration / distance))
+                    animation.timingFunction = CAMediaTimingFunction(controlPoints: 1 / 3, Float(slope / 3), 2 / 3, 1)
+                } else {
+                    animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                }
             }
             animation.fromValue = NSValue(point: from)
             animation.toValue = NSValue(point: layer.position)
             animation.preferredFrameRateRange = CAFrameRateRange(minimum: rate, maximum: rate, preferred: rate)
             layer.add(animation, forKey: "space-position")
+            if layer === outgoingLayer {
+                finishGround?((destination ?? source)?.swipeSpace)
+                let start = Double(min(1, abs((from.x - outgoingLayer.bounds.width * outgoingLayer.anchorPoint.x - contentInset) / travelWidth)))
+                finishGround = source?.spaceGesture.animateGround?(preparedOrigin, preparedTarget,
+                    start, returning ? 0 : 1, animation, presentedGround)
+            }
         }
         CATransaction.commit()
+        if let screen = window?.screen ?? NSScreen.main {
+            progressLink?.invalidate()
+            let link = screen.displayLink(target: self, selector: #selector(advanceProgress(_:)))
+            let rate = Float(screen.maximumFramesPerSecond)
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: rate, maximum: rate, preferred: rate)
+            progressLink = link
+            link.add(to: .main, forMode: .common)
+        }
+    }
+
+    @objc private func advanceProgress(_ link: CADisplayLink) {
+        guard !finished, let presentation = outgoing.layer?.presentation() else { return }
+        publishProgress(presentation.frame.minX - contentInset)
+    }
+
+    private func publishProgress(_ drag: CGFloat) {
+        guard let gesture = source?.spaceGesture else { return }
+        Motion.instant { gesture.nativeDrag = drag }
+        gesture.trackGround?(Double(min(1, abs(drag / travelWidth))))
     }
 
     func cancel() {
         completion = nil
-        finish()
+        if finished { retire() }
+        else { finish() }
+    }
+
+    /// The sidebar owning this overlay has closed. Complete committed selection once,
+    /// then uncover the page without waiting for an acknowledgement from a removed tree.
+    func sidebarDidDisappear(_ store: TabStore) {
+        guard !completingSelection, (destination ?? source) === store,
+              !store.sidebarShown, !store.sidebarPeeking else { return }
+        (superview as? BrowserWindowHost)?.clearQueuedSpaceSelection()
+        // An in-flight completion may attach a different, visible sidebar. Let
+        // finish() evaluate that arrival; only an already-finished hidden owner can cut.
+        if finished { retire() }
+        else { finish() }
+    }
+
+    /// An unused idle surface has never owned the gesture's visibility state.
+    func discardPreparation() {
+        finished = true
+        finishGround?((destination ?? source)?.swipeSpace)
+        finishGround = nil
+        progressLink?.invalidate()
+        progressLink = nil
+        if let motionObserver { NSWorkspace.shared.notificationCenter.removeObserver(motionObserver) }
+        motionObserver = nil
+        removeFromSuperview()
     }
 
     func finish() {
         guard !finished else { return }
         finished = true
+        animationID = nil
+        progressLink?.invalidate()
+        progressLink = nil
         if let motionObserver { NSWorkspace.shared.notificationCenter.removeObserver(motionObserver) }
         motionObserver = nil
         let complete = completion
         completion = nil
+        completingSelection = true
         complete?()
-        Motion.instant {
+        completingSelection = false
+        finishGround?((destination ?? source)?.swipeSpace)
+        finishGround = nil
+        Motion.spaceHandoff {
             source?.spaceGesture.profileSliding = false
             destination?.spaceGesture.profileSliding = false
         }
+        // Keep the native rows until the live tree acknowledges its resting identity.
+        // The two surfaces contain translucent ink: leaving both visible for extra
+        // display frames brightens every row, including a canceled swipe's origin.
+        if complete != nil, !Motion.spaceReduced, let window {
+            let arriving = destination ?? source
+            if let arriving, !arriving.sidebarShown, !arriving.sidebarPeeking {
+                retire()
+                return
+            }
+            if let arriving, arriving.currentSpaceID != preparedOrigin.id
+                || arriving.spaceGesture.sectionsView != nil
+                || sidebarAcknowledgements[ObjectIdentifier(arriving)] != nil {
+                retirementStore = arriving
+                retirementSpaceID = arriving.currentSpaceID
+                // A disconnected window may never update its anchor. Bound that
+                // exceptional wait; visible sidebar retirement is acknowledged.
+                let timeout = DispatchWorkItem { [weak self] in self?.retire() }
+                retirementTimeout = timeout
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: timeout)
+                retireIfAcknowledged()
+            } else {
+                scheduleRetirement(in: window)
+            }
+        } else { retire() }
+    }
+
+    /// Called by the live sections' representable after SwiftUI updates their identity
+    /// and removes the gesture offset. A display tick alone cannot establish that.
+    func sidebarDidUpdate(_ store: TabStore, renderedSpaceID: UUID?, atRest: Bool) {
+        // NSHostingView may acknowledge synchronously during completion's final state
+        // publication, before finish() knows the arriving store. Retain that rendered
+        // identity/rest pair instead of waiting for a second update that may never come.
+        guard finished else { return }
+        sidebarAcknowledgements[ObjectIdentifier(store)] = (renderedSpaceID, atRest)
+        retireIfAcknowledged()
+    }
+
+    private func retireIfAcknowledged() {
+        guard finished, let store = retirementStore,
+              let rendered = sidebarAcknowledgements[ObjectIdentifier(store)], rendered.atRest,
+              rendered.spaceID == retirementSpaceID, store.currentSpaceID == retirementSpaceID,
+              !store.spaceSwiping, !store.spaceGesture.profileSliding else { return }
+        // This acknowledgement is issued by SwiftUI while committing the live opacity
+        // and identity. Remove the native list in that same transaction, not two frames
+        // later when both lists would already have painted their translucent text.
+        retire()
+    }
+
+    private func scheduleRetirement(in window: NSWindow) {
+        guard !retirementScheduled else { return }
+        retirementScheduled = true
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self else { return }
+            guard let window, self.window === window else { self.retire(); return }
+            self.superview?.layoutSubtreeIfNeeded()
+            _ = SpaceLandingFrame(window: window) { [weak self] in self?.retire() }
+        }
+    }
+
+    private func retire() {
+        retirementTimeout?.cancel()
+        retirementTimeout = nil
+        retirementStore = nil
+        sidebarAcknowledgements.removeAll()
         let host = superview as? BrowserWindowHost
         removeFromSuperview()
         host?.didFinishSpaceSlide(self)

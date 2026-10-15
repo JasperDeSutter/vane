@@ -151,6 +151,12 @@ enum LibrarySection: String, CaseIterable, Identifiable, Sendable {
     /// to the page, so the next keystroke is the page's rather than falling on a rail that is
     /// not there any more.
     static func close(_ store: TabStore) {
+        // The prepared panel stays mounted through its exit. Relinquish its responder
+        // before publishing the close, so focusPage can restore the page immediately.
+        if store.libraryOpen, store.palette == nil, NSApp.modalWindow == nil,
+           let window = store.window, window.attachedSheet == nil {
+            window.makeFirstResponder(nil)
+        }
         store.libraryOpen = false
         store.focusPage()
     }
@@ -878,6 +884,9 @@ struct LibraryHead<Filter: View, Actions: View>: View {
         .animation(Motion.reduced ? nil : Look.quick, value: filtering)
         .onAppear { takeKeyboard() }
         .onChange(of: library.focusToken) { takeKeyboard() }
+        .onChange(of: store.libraryOpen) {
+            if !store.libraryOpen { focused = false }
+        }
     }
 
     /// A turn later, not now. `@FocusState` set while the field is still being installed in
@@ -1240,6 +1249,7 @@ private struct BoostsPane: View {
 // MARK: - Downloads
 
 private struct DownloadsPane: View {
+    @EnvironmentObject private var store: TabStore
     let downloads: DownloadLibrary
     @ObservedObject private var library = Library.shared
 
@@ -1280,6 +1290,9 @@ private struct DownloadsPane: View {
             }
         }
         .onAppear { downloads.refreshMissing(); presentation.refresh(); refresh() }
+        .onChange(of: store.libraryOpen) {
+            if store.libraryOpen { downloads.refreshMissing(); presentation.refresh(); refresh() }
+        }
         .onChange(of: presentation.rows) { refresh() }
         .onChange(of: library.query) { refresh() }
         .onChange(of: library.completedOnly) { refresh() }
@@ -1366,6 +1379,7 @@ private struct DownloadVerbs: View {
 /// second thing to keep in step for no answer it could give that this cannot. Ceiling: an
 /// image the user looked at but never downloaded is not here.
 private struct MediaPane: View {
+    @EnvironmentObject private var store: TabStore
     let downloads: DownloadLibrary
     @ObservedObject private var library = Library.shared
     @ObservedObject private var presentation: Feel05DownloadPresentation
@@ -1422,6 +1436,9 @@ private struct MediaPane: View {
             }
         }
         .onAppear { downloads.refreshMissing(); presentation.refresh(); refresh() }
+        .onChange(of: store.libraryOpen) {
+            if store.libraryOpen { downloads.refreshMissing(); presentation.refresh(); refresh() }
+        }
         .onChange(of: presentation.rows) { refresh() }
         .onChange(of: library.query) { refresh() }
     }

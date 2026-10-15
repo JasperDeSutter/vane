@@ -450,12 +450,12 @@ struct BrowserWindow: View {
         .onChange(of: store.libraryOpen) { if store.libraryOpen { spaceCount = profiles.allSpaces.count } }
         // The page slides over as the panel takes its width, and back when it gives it up —
         // including when the Spaces section widens the panel to fit another card.
-        .animation(reduceMotion || batterySaver.isActive ? nil : Look.librarySlide, value: libraryWidth)
+        .animation(reduceMotion || batterySaver.isActive ? nil : Look.appear, value: libraryWidth)
         .animation(reduceMotion || batterySaver.isActive ? nil : .easeOut(duration: 0.2),
                    value: store.sidebarShown)
         .animation(reduceMotion || batterySaver.isActive ? nil
                    : Look.floatingSidebarAnimation, value: peeking)
-        .animation(reduceMotion || batterySaver.isActive ? nil : Look.librarySlide, value: store.libraryOpen)
+        .animation(reduceMotion || batterySaver.isActive ? nil : Look.appear, value: store.libraryOpen)
         .animation(reduceMotion || batterySaver.isActive ? nil : Look.appear, value: store.palette == nil)
         // Arc hides the traffic lights along with the sidebar: a collapsed window is the
         // page and nothing else. They come back the moment either sidebar does.
@@ -589,42 +589,19 @@ struct SpaceGround: View {
         ZStack {
             if store.isPrivate { Color(hex: Profile.incognito.colorHex) }
             NativeThemeWash(wash: wash, reduced: reduceMotion, gesture: gesture,
-                            origin: mine, destination: pull.surface)
+                            origin: mine, destination: pull.surface, fallback: store.profile,
+                            profiles: profiles.profiles, systemDark: systemDark)
         }
         // Gesture transactions already own the travel and cancellation timing. Only a
         // direct Space change or a theme edit needs a local animation.
-        .animation(reduceMotion ? nil : Look.spaceSlide, value: store.currentSpaceID)
+        .animation(reduceMotion || gesture.swiping ? nil : Look.spaceSlide, value: store.currentSpaceID)
         .animation(reduceMotion ? nil : Look.appear, value: store.spaceRevision)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
 
     private func surface(of space: Space?, systemDark: Bool) -> ThemeWash {
-        let dark: Bool
-        switch space?.appearance {
-        case "dark": dark = true
-        case "light": dark = false
-        default:
-            // A neighbour following the system must not inherit the departing Space's
-            // pinned appearance. The environment still invalidates us on system changes.
-            dark = systemDark
-        }
-        return ThemeWash(colors: colors(of: space), strength: space?.tint ?? Look.defaultTint,
-                         opacity: Look.groundOpacity(dark: dark, strength: space?.tint ?? Look.defaultTint),
-                         grain: space?.grain ?? 0, dark: dark)
-    }
-
-    /// A Space's colours, falling back to its profile's — Arc has no colourless space, and a
-    /// grey slab was what the old fallback amounted to.
-    ///
-    /// Its *own* profile's, which need not be this window's: the strip crosses profiles, and
-    /// the wash a swipe pulls in has to be the neighbour's colour or the window would slide to
-    /// one ground and then cut to another on landing.
-    private func colors(of space: Space?) -> [ThemeColor] {
-        let list = space.map(Spaces.palette(of:)) ?? []
-        guard list.isEmpty else { return list }
-        let owner = space.flatMap { s in profiles.profiles.first { $0.id == s.profileID } }
-        return [ThemeColor(hex: (owner ?? store.profile).colorHex)!]
+        ThemeWash.space(space, fallback: store.profile, profiles: profiles.profiles, systemDark: systemDark)
     }
 
     /// The Space the fingers are pulling in, its grain, and how much of it is already
@@ -639,7 +616,9 @@ struct SpaceGround: View {
         let idle = (surface(of: here, systemDark: systemDark), 0.0)
         let width = SidebarWidth.shared.width
         let drag = gesture.nativeDrag ?? gesture.drag
-        guard drag != 0, width > 0, let target = gesture.neighbour else { return idle }
+        // Zero progress still needs the destination: native tracking can advance the
+        // wash without publishing another SwiftUI body update after a click starts.
+        guard width > 0, let target = gesture.neighbour else { return idle }
         return (surface(of: target, systemDark: systemDark), Double(min(1, abs(drag / width))))
     }
 }
@@ -650,6 +629,7 @@ struct SpaceGround: View {
 /// hovers over the page (find, the save-password prompt) inside its clip.
 struct WebCard: View {
     @EnvironmentObject var store: TabStore
+    @Environment(\.libraryPageLeadingInset) private var libraryPageLeadingInset
     @ObservedObject private var batterySaver = BatterySaver.shared
     @ObservedObject private var profileManager = ProfileManager.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -759,7 +739,7 @@ struct WebCard: View {
         // No inset on the leading edge while the sidebar is docked — its own padding
         // already leaves the gap, and doubling it reads as a misaligned card. The Library's
         // column stands in the same place and leaves the same gap.
-        .padding(.leading, store.sidebarShown || store.libraryOpen ? 0 : Look.cardGap)
+        .padding(.leading, libraryPageLeadingInset ?? (store.sidebarShown || store.libraryOpen ? 0 : Look.cardGap))
         .padding(.top, topGap)
         .padding([.trailing, .bottom], Look.cardGap)
     }
@@ -2878,7 +2858,7 @@ private struct SpaceDots: View {
                 .opacity(lit)
                 .scaleEffect(Look.tileAppearScale + (1 - Look.tileAppearScale) * lit)
         }
-        .animation(animation, value: here)
+        .animation(gesture.swiping ? nil : animation, value: here)
         .frame(width: layout.itemWidth, height: Look.spaceDotHit)
         .background(!layout.showsButtonBackground ? .clear : dropTarget == space.id ? chromeTheme.selected : hovered == space.id ? chromeTheme.hovered : .clear,
                     in: .rect(cornerRadius: Look.pillRadius))
@@ -2924,7 +2904,8 @@ private struct SpaceDots: View {
     /// heading for, in step with them, so the footer says where the gesture will land before
     /// it lands. At the ends nothing is handed over — the strip is only rubber-banding.
     private func weights(_ list: [Space]) -> [UUID: Double] {
-        guard let current = store.currentSpaceID, list.contains(where: { $0.id == current }) else { return [:] }
+        guard let current = gesture.outgoing?.space.id ?? store.currentSpaceID,
+              list.contains(where: { $0.id == current }) else { return [:] }
         let width = SidebarWidth.shared.width
         let drag = footer.drag ?? gesture.drag
         guard drag != 0, width > 0, let target = gesture.neighbour else { return [current: 1] }

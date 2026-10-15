@@ -407,10 +407,8 @@ enum Spaces {
         /// strip through the next Space and the one after it.
         enum Phase { case began, changed, ended, cancelled, momentum }
 
-        /// How far across the sidebar the fingers have to carry the strip to commit
-        /// while still down. A shade under a third, so the page changes earlier in the
-        /// gesture; below ~0.25 a diagonal scroll
-        /// down a long tab list changes Space by accident.
+        /// How far across the sidebar a released drag must travel to select a Space.
+        /// The fingers can hold or reverse anywhere before release.
         static let commitFraction: CGFloat = 0.3
         /// …or this fast, in points per second, so a flick that barely moves still switches.
         static let flickSpeed: CGFloat = 600
@@ -478,13 +476,6 @@ enum Spaces {
                 if pull >= Self.pullFull {
                     armed = false
                     return (offset, 1, Self.pullFull)
-                }
-                // Distance is deliberate enough to commit before fingers-up. Velocity
-                // alone still waits for release so a short flick can reverse or cancel.
-                if let direction = Self.commit(travel: travel, speed: 0, width: width,
-                                               count: count, index: index) {
-                    armed = false
-                    return (offset, direction, pull)
                 }
                 return (offset, nil, pull)
             case .ended:
@@ -792,8 +783,8 @@ enum Spaces {
 
         assert("the strip tracks the fingers one for one",
                swipe([(0, .began), (-30, .changed), (-30, .changed)]).last == -60)
-        assert("crossing the distance threshold commits while the fingers are still down",
-               swipe([(0, .began), (-200, .changed)]).commits == [1])
+        assert("crossing the distance threshold stays under the fingers until release",
+               swipe([(0, .began), (-200, .changed)]).commits.isEmpty)
         assert("a short slow drag springs back rather than switching",
                swipe(slow(-w * 0.2, steps: 60), dt: 0.05).commits.isEmpty)
         do {
@@ -854,10 +845,10 @@ enum Spaces {
                      dt: 0.05).commits == [1])
         var once = Swipe()
         _ = once.feed(dx: 0, dt: 0, phase: .began, width: w, count: 3, index: 1)
-        assert("crossing the distance threshold commits exactly once",
-               once.feed(dx: -200, dt: 0.05, phase: .changed, width: w, count: 3, index: 1).commit == 1)
-        assert("fingers-up does not repeat an early commit",
-               once.feed(dx: 0, dt: 0, phase: .ended, width: w, count: 3, index: 1).commit == nil)
+        assert("crossing the distance threshold keeps tracking",
+               once.feed(dx: -200, dt: 0.05, phase: .changed, width: w, count: 3, index: 1).commit == nil)
+        assert("fingers-up commits the destination exactly once",
+               once.feed(dx: 0, dt: 0, phase: .ended, width: w, count: 3, index: 1).commit == 1)
         assert("a second fingers-up in the same gesture does not",
                once.feed(dx: 0, dt: 0, phase: .ended, width: w, count: 3, index: 1).commit == nil)
         assert("and the strip is not dragged any further either",

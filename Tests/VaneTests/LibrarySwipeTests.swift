@@ -46,9 +46,303 @@ import XCTest
 
     private func send(_ window: NSWindow, point: NSPoint = NSPoint(x: 100, y: 350),
                       dx: CGFloat = 0, dy: CGFloat = 0, phase: NSEvent.Phase = .changed,
-                      momentum: NSEvent.Phase = [], precise: Bool = true, inverted: Bool = true) {
+                      momentum: NSEvent.Phase = [], precise: Bool = true, inverted: Bool = true,
+                      time: TimeInterval = 1) {
         NSApplication.shared.sendEvent(LibraryScrollEvent(window: window, point: point,
-            dx: dx, dy: dy, phase: phase, momentum: momentum, precise: precise, inverted: inverted))
+            dx: dx, dy: dy, phase: phase, momentum: momentum, precise: precise, inverted: inverted, time: time))
+    }
+
+    func testOriginalShortLibraryDragsReturnAtAnySpeed() {
+        let (store, window, _) = fixture(withSpaces: true)
+        for initiallyOpen in [false, true] {
+            for (interval, shouldCommit) in [(0.008, false), (0.2, false)] {
+                store.libraryOpen = initiallyOpen
+                let delta: CGFloat = initiallyOpen ? -20 : 20
+                send(window, phase: .began, time: 1)
+                send(window, dx: delta, time: 1 + interval)
+                send(window, dx: delta, time: 1 + 2 * interval)
+                XCTAssertEqual(store.libraryOpen, initiallyOpen)
+                send(window, phase: .ended, time: 1 + 2 * interval + 0.001)
+                XCTAssertEqual(store.libraryOpen, shouldCommit ? !initiallyOpen : initiallyOpen,
+                               "Short flicks must carry their intent in either direction")
+            }
+        }
+    }
+
+    func testSubpixelHorizontalWobbleReleasesLibraryToVerticalScrolling() {
+        let (store, window, _) = fixture(withSpaces: true)
+        for open in [true, false] {
+            store.libraryOpen = open
+            let before = window.scrolls
+            send(window, phase: .began)
+            send(window, dx: open ? -0.2 : 0.2, dy: 0.1)
+            XCTAssertNil(store.librarySwipeProgress)
+            send(window, dy: 12)
+            XCTAssertNil(store.librarySwipeProgress)
+            XCTAssertEqual(store.libraryOpen, open)
+            XCTAssertEqual(window.scrolls, before + 3)
+            send(window, phase: .ended)
+        }
+    }
+
+    func testOriginalLibraryAxisLockAcceptsHorizontalTravelAfterStartupNoise() {
+        let saver = BatterySaver.shared
+        let previousMode = saver.mode
+        defer { saver.setMode(previousMode) }
+        let (store, window, monitor) = fixture(withSpaces: true)
+        for mode: BatterySaver.Mode in [.off, .alwaysOn] {
+            saver.setMode(mode)
+            for open in [false, true] {
+                for (dx, dy): (CGFloat, CGFloat) in [(0, 0.5), (0.1, 0.2), (-0.2, 0.1)] {
+                    monitor.remove()
+                    monitor.install(store)
+                    store.libraryOpen = open
+                    send(window, phase: .began)
+                    send(window, dx: dx, dy: dy)
+                    XCTAssertNil(store.librarySwipeProgress)
+                    let event = LibraryScrollEvent(window: window, point: NSPoint(x: 100, y: 350),
+                        dx: open ? -12 : 12, dy: 0, phase: .changed, momentum: [],
+                        precise: true, inverted: true, time: 1)
+                    XCTAssertNil(monitor.handle(event, in: store),
+                                 "Startup noise must not reject a deliberate horizontal drag")
+                    if Motion.reduced {
+                        XCTAssertNil(store.librarySwipeProgress)
+                    } else {
+                        XCTAssertNotNil(store.librarySwipeProgress)
+                    }
+                }
+            }
+        }
+    }
+
+    func testClosingMountedLibrarySearchReturnsKeyboardToPage() async throws {
+        let (store, window, _) = fixture(withSpaces: true)
+        let tab = store.newBlankTab(loading: URL(string: "about:blank"))
+        store.palette = nil
+        let host = NSHostingView(rootView: BrowserWindow().environmentObject(store)
+            .environmentObject(ProfileManager.shared))
+        window.contentView = host
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil); window.contentView = nil }
+        Library.open(.downloads, in: store)
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(150))
+        func search(_ view: NSView) -> NSTextField? {
+            if let field = view as? NSTextField, field.isEditable { return field }
+            return view.subviews.lazy.compactMap { search($0) }.first
+        }
+        let field = try XCTUnwrap(search(host))
+        for _ in 0..<50 where !(window.firstResponder is NSTextView) {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(window.firstResponder is NSTextView)
+        // A departing panel stays enabled while its native/SwiftUI landing is in flight.
+        // Hold that presentation to cover delayed or interrupted completion.
+        store.librarySwipeProgress = 0.5
+        Library.close(store)
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(700))
+        XCTAssertNotNil(field.superview, "The prepared panel remains mounted")
+        let responder = window.firstResponder as? NSView
+        XCTAssertTrue(responder === tab.web || responder?.isDescendant(of: tab.web) == true,
+                      "The invisible search field must release page keyboard input; holder=\(String(describing: window.firstResponder)) page=\(String(describing: store.activePageResponder)) webWindow=\(tab.web.window != nil) palette=\(store.palette != nil)")
+    }
+
+    func testOpeningEaselReleasesDepartingLibrarySearchFocus() async throws {
+        let (store, window, _) = fixture(withSpaces: true)
+        _ = store.newBlankTab(loading: URL(string: "about:blank"))
+        store.palette = nil
+        let host = NSHostingView(rootView: BrowserWindow().environmentObject(store)
+            .environmentObject(ProfileManager.shared))
+        window.contentView = host
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil); window.contentView = nil }
+        Library.open(.easels, in: store)
+        host.layoutSubtreeIfNeeded()
+        func search(_ view: NSView) -> NSTextField? {
+            if let field = view as? NSTextField,
+               field.placeholderString?.contains("Search Easels") == true { return field }
+            return view.subviews.lazy.compactMap { search($0) }.first
+        }
+        let focusDeadline = ProcessInfo.processInfo.systemUptime + 1
+        while (search(host)?.currentEditor() == nil), ProcessInfo.processInfo.systemUptime < focusDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let field = try XCTUnwrap(search(host))
+        XCTAssertTrue(field.currentEditor() === window.firstResponder,
+                      "The real Easel search autofocus must own the field editor first")
+        store.librarySwipeProgress = 0.5
+        let tab = try XCTUnwrap(store.openEasel(create: true))
+        let boardID = try XCTUnwrap(tab.easelID)
+        defer { try? EaselStore.shared(profileID: store.profileID, directory: Store.directory).delete(boardID) }
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(700))
+        XCTAssertFalse(store.libraryOpen)
+        XCTAssertNotNil(field.superview, "The departing search remains mounted during landing")
+        let page = try XCTUnwrap(store.activePageResponder)
+        let responder = window.firstResponder as? NSView
+        XCTAssertTrue(responder === page || responder?.isDescendant(of: page) == true,
+                      "Opening the board must return keyboard input to its Easel page; holder=\(String(describing: window.firstResponder))")
+        let holder = window.firstResponder
+        Library.focusSearch()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(window.firstResponder === holder,
+                      "A delayed focus token must not refocus the logically closed Easel search")
+    }
+
+    func testReopeningMountedDownloadAndMediaPanesRefreshesMissingFiles() async throws {
+        let (store, window, _) = fixture(withSpaces: true)
+        let downloads = Downloads.manager(for: store.profileID)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let host = NSHostingView(rootView: LibraryPanel().environmentObject(store))
+        window.contentView = host
+        defer { window.contentView = nil }
+        for section: LibrarySection in [.downloads, .media] {
+            let file = directory.appendingPathComponent(UUID().uuidString + ".png")
+            try Data([1]).write(to: file)
+            let item = downloads.add(.init(name: file.lastPathComponent, destination: file, state: "done"))
+            defer { downloads.forget(item) }
+            Library.open(section, in: store)
+            host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(80))
+            XCTAssertEqual(item.status, .done)
+            Library.close(store)
+            host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(80))
+            try FileManager.default.removeItem(at: file)
+            Library.open(section, in: store)
+            host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(80))
+            XCTAssertEqual(item.status, .missing, "A mounted pane must refresh on logical reopen")
+        }
+    }
+
+    func testLibraryIsLaidOutBeforeFirstDragSample() async throws {
+        let (store, window, monitor) = fixture(withSpaces: true)
+        Library.open(.downloads, in: store)
+        store.libraryOpen = false
+        store.sidebarShown = true
+        store.palette = nil
+        let host = NSHostingView(rootView: BrowserWindow().environmentObject(store)
+            .environmentObject(ProfileManager.shared))
+        window.contentView = host
+        defer { window.contentView = nil }
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(150))
+        let prepared = try XCTUnwrap(monitor.presentationView,
+                                    "The panel must be mounted before the first input")
+        send(window, phase: .began)
+        for delta: CGFloat in [12, 3, 3, 3, 3] {
+            let start = ProcessInfo.processInfo.systemUptime
+            send(window, dx: delta)
+            host.layoutSubtreeIfNeeded()
+            print("LIBRARY_INITIAL_LAYOUT delta=\(delta) seconds=\(ProcessInfo.processInfo.systemUptime - start)")
+            XCTAssertTrue(monitor.presentationView === prepared)
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    func testLibraryDragMovesThePageWithoutResizingWebKitForEachSample() async throws {
+        try XCTSkipIf(Motion.reduced, "Requires interactive navigation")
+        let (store, window, _) = fixture(withSpaces: true)
+        Library.open(.downloads, in: store)
+        store.libraryOpen = false
+        store.sidebarShown = true
+        let tab = store.newBlankTab(loading: URL(string: "about:blank"))
+        store.palette = nil
+        let host = NSHostingView(rootView: BrowserWindow().environmentObject(store)
+            .environmentObject(ProfileManager.shared))
+        window.contentView = host
+        window.orderFront(nil)
+        defer { window.orderOut(nil); window.contentView = nil }
+        try await Task.sleep(for: .milliseconds(100))
+        let initialWidth = tab.web.bounds.width
+        let initialX = tab.web.convert(.zero, to: host).x
+        XCTAssertGreaterThan(initialWidth, 100)
+        send(window, phase: .began)
+        send(window, dx: 40)
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(tab.web.bounds.width, initialWidth, accuracy: 1,
+                       "Finger tracking must translate the page, without repeated WebKit reflow")
+        XCTAssertGreaterThan(tab.web.convert(.zero, to: host).x, initialX + 5,
+                             "The stable page must still move with the navigation")
+        send(window, dx: 40)
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(tab.web.bounds.width, initialWidth, accuracy: 1)
+        send(window, phase: .ended)
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertNil(store.librarySwipeProgress)
+        XCTAssertNil(store.libraryGesture.pageWidth)
+        XCTAssertLessThan(tab.web.bounds.width, initialWidth - 50,
+                          "Apply the destination page width once the navigation settles")
+    }
+
+    func testFloatingSidebarLibraryLandingKeepsInnerWebWidthFixed() async throws {
+        try XCTSkipIf(Motion.reduced, "Requires animated navigation")
+        let (store, window, _) = fixture(withSpaces: true)
+        Library.open(.downloads, in: store)
+        store.sidebarShown = false
+        let tab = store.newBlankTab(loading: URL(string: "about:blank"))
+        store.palette = nil
+        let host = NSHostingView(rootView: BrowserWindow().environmentObject(store)
+            .environmentObject(ProfileManager.shared))
+        window.contentView = host
+        window.orderFront(nil)
+        defer { window.orderOut(nil); window.contentView = nil }
+        try await Task.sleep(for: .milliseconds(100))
+        let width = tab.web.bounds.width
+        send(window, phase: .began)
+        send(window, dx: -80)
+        try await Task.sleep(for: .milliseconds(40))
+        send(window, phase: .ended)
+        XCTAssertFalse(store.libraryOpen)
+        var landingSamples = 0
+        for _ in 0..<4 {
+            try await Task.sleep(for: .milliseconds(30))
+            if store.libraryGesture.pageWidth != nil {
+                landingSamples += 1
+                XCTAssertEqual(tab.web.bounds.width, width, accuracy: 0.5,
+                               "The floating card's inner padding must stay fixed through landing")
+            }
+        }
+        XCTAssertGreaterThan(landingSamples, 0, "Inspect the page while its landing is in progress")
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertNil(store.libraryGesture.pageWidth)
+        XCTAssertNil(store.libraryGesture.pageLeadingInset)
+        XCTAssertGreaterThan(tab.web.bounds.width, width + 50)
+    }
+
+    func testImmediateLibraryReleaseStillShowsIntermediatePositions() async throws {
+        try XCTSkipIf(Motion.reduced, "Requires animated navigation")
+        let (store, window, monitor) = fixture(withSpaces: true)
+        Library.open(.downloads, in: store)
+        store.libraryOpen = false
+        store.sidebarShown = true
+        store.palette = nil
+        let host = NSHostingView(rootView: BrowserWindow().environmentObject(store)
+            .environmentObject(ProfileManager.shared))
+        window.contentView = host
+        window.orderFront(nil)
+        defer { window.orderOut(nil); window.contentView = nil }
+        try await Task.sleep(for: .milliseconds(80))
+        send(window, phase: .began, time: 1)
+        send(window, dx: 40, time: 1.008)
+        send(window, dx: 40, time: 1.016)
+        send(window, phase: .ended, time: 1.017) // No render turn before the fast release.
+        try await Task.sleep(for: .milliseconds(60))
+        let marker = try XCTUnwrap(monitor.presentationView)
+        func x() throws -> CGFloat {
+            try XCTUnwrap(marker.layer?.presentation()).convert(.zero,
+                to: host.layer?.presentation()).x
+        }
+        let moving = try x()
+        XCTAssertLessThan(moving, -5, "A quick release must not mount directly at the endpoint")
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertGreaterThan(try x(), moving + 5)
+        try await Task.sleep(for: .milliseconds(400))
+        XCTAssertEqual(try x(), 0, accuracy: 1)
     }
 
     func testFingerUpdatesDoNotInvalidateBrowserState() throws {
@@ -324,9 +618,10 @@ import XCTest
         send(window, phase: .ended)
         try await Task.sleep(for: .milliseconds(500))
         XCTAssertNil(store.librarySwipeProgress)
-        XCTAssertNil(search(host))
+        XCTAssertTrue(search(host) === field, "Keep the panel ready offscreen for the next gesture")
+        XCTAssertFalse(field.isEnabled, "Closed Library fields cannot retain keyboard interaction")
 
-        // A short swipe springs back without committing or keeping a hidden panel alive.
+        // A short swipe springs back without committing; the prepared panel stays inactive.
         send(window, phase: .began)
         send(window, dx: 40)
         try await Task.sleep(for: .milliseconds(40))
@@ -335,7 +630,8 @@ import XCTest
         XCTAssertFalse(store.libraryOpen)
         try await Task.sleep(for: .milliseconds(500))
         XCTAssertNil(store.librarySwipeProgress)
-        XCTAssertNil(search(host))
+        XCTAssertTrue(search(host) === field)
+        XCTAssertFalse(field.isEnabled)
     }
 
     func testBatterySaverUsesImmediateDestinationWithoutInteractivePreview() {
@@ -773,6 +1069,7 @@ private final class LibraryScrollWindow: NSWindow {
 }
 
 private final class LibraryScrollEvent: NSEvent, @unchecked Sendable {
+    private let eventTime: TimeInterval
     private let target: NSWindow
     private let targetNumber: Int
     private let point: NSPoint
@@ -784,7 +1081,9 @@ private final class LibraryScrollEvent: NSEvent, @unchecked Sendable {
     private let inverted: Bool
 
     @MainActor init(window: NSWindow, point: NSPoint, dx: CGFloat, dy: CGFloat,
-                    phase: NSEvent.Phase, momentum: NSEvent.Phase, precise: Bool, inverted: Bool) {
+                    phase: NSEvent.Phase, momentum: NSEvent.Phase, precise: Bool, inverted: Bool,
+                    time: TimeInterval = 1) {
+        eventTime = time
         target = window
         targetNumber = window.windowNumber
         self.point = point
@@ -807,5 +1106,5 @@ private final class LibraryScrollEvent: NSEvent, @unchecked Sendable {
     override var scrollingDeltaY: CGFloat { dy }
     override var phase: NSEvent.Phase { scrollPhase }
     override var momentumPhase: NSEvent.Phase { momentum }
-    override var timestamp: TimeInterval { 1 }
+    override var timestamp: TimeInterval { eventTime }
 }

@@ -30,6 +30,37 @@ import XCTest
         return (store, second, window)
     }
 
+    func testOriginalAxisLockIgnoresSubpixelNoiseAndClaimsDeliberateTravel() {
+        let (store, _, window) = fixture()
+        let monitor = SwipeMonitor()
+        monitor.install(store)
+        defer { monitor.remove() }
+        NSApplication.shared.sendEvent(ScrollEvent(window: window, phase: .began))
+        NSApplication.shared.sendEvent(ScrollEvent(window: window, dx: -0.2, dy: 0.1))
+        XCTAssertFalse(store.spaceSwiping)
+        NSApplication.shared.sendEvent(ScrollEvent(window: window, dy: 12))
+        XCTAssertFalse(store.spaceSwiping)
+        NSApplication.shared.sendEvent(ScrollEvent(window: window, phase: .began))
+        NSApplication.shared.sendEvent(ScrollEvent(window: window, dx: -12))
+        XCTAssertTrue(store.spaceSwiping)
+        XCTAssertEqual(store.spaceDrag, -12)
+    }
+
+    func testOriginalAxisLockAcceptsHorizontalTravelAfterVerticalStartupNoise() {
+        let (store, _, window) = fixture()
+        let monitor = SwipeMonitor()
+        monitor.install(store)
+        defer { monitor.remove() }
+        for (dx, dy): (CGFloat, CGFloat) in [(0, 0.5), (0.1, 0.2), (-0.2, 0.1)] {
+            NSApplication.shared.sendEvent(ScrollEvent(window: window, phase: .began))
+            NSApplication.shared.sendEvent(ScrollEvent(window: window, dx: dx, dy: dy))
+            XCTAssertFalse(store.spaceSwiping)
+            NSApplication.shared.sendEvent(ScrollEvent(window: window, dx: -12))
+            XCTAssertTrue(store.spaceSwiping, "Startup noise must not reject a deliberate horizontal drag")
+            monitor.abort()
+        }
+    }
+
     func testSidebarSwipeIsClaimedWithNewTabPaletteOpen() {
         let (store, _, window) = fixture()
         let monitor = SwipeMonitor()
@@ -74,7 +105,7 @@ import XCTest
         XCTAssertEqual(store.palette, .newTab)
     }
 
-    func testSwipeChangesPageBeforeReleaseAndReplacementMonitorConsumesTheTail() async throws {
+    func testSwipeHoldsBetweenSpacesUntilReleaseAndReplacementMonitorConsumesTheTail() async throws {
         let (store, second, window) = fixture()
         let first = try XCTUnwrap(store.spaces.first)
         store.switchTo(space: second)
@@ -87,7 +118,11 @@ import XCTest
         defer { monitor.remove() }
         NSApplication.shared.sendEvent(ScrollEvent(window: window, phase: .began))
         NSApplication.shared.sendEvent(ScrollEvent(window: window, dx: -SidebarWidth.shared.width * 0.31))
-        // No fingers-up event: the destination must appear during the swipe itself.
+        // Holding past the threshold must remain interactive until fingers-up.
+        try await Task.sleep(for: .milliseconds(350))
+        XCTAssertEqual(store.currentSpaceID, first.id)
+        XCTAssertTrue(store.spaceSwiping)
+        NSApplication.shared.sendEvent(ScrollEvent(window: window, phase: .ended))
         try await Task.sleep(for: .milliseconds(350))
         XCTAssertEqual(store.currentSpaceID, second.id)
         XCTAssertTrue(store.active === page)
@@ -111,6 +146,7 @@ import XCTest
         XCTAssertEqual(window.scrolls, scrolls + 1, "An ordinary mouse wheel remains available")
         NSApplication.shared.sendEvent(ScrollEvent(window: window, phase: .began))
         NSApplication.shared.sendEvent(ScrollEvent(window: window, dx: SidebarWidth.shared.width * 0.31))
+        NSApplication.shared.sendEvent(ScrollEvent(window: window, phase: .ended))
         try await Task.sleep(for: .milliseconds(350))
         XCTAssertEqual(store.currentSpaceID, first.id, "A new gesture can switch back")
         NSApplication.shared.sendEvent(ScrollEvent(window: window, phase: .ended))
@@ -129,7 +165,7 @@ private final class ScrollWindow: NSWindow {
 
 /// Trackpad samples enter through AppKit's real local event monitors without moving
 /// the user's cursor or requiring accessibility permissions.
-private final class ScrollEvent: NSEvent, @unchecked Sendable {
+final class ScrollEvent: NSEvent, @unchecked Sendable {
     private let owner: NSWindow
     private let ownerNumber: Int
     private let eventPhase: NSEvent.Phase

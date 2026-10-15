@@ -43,6 +43,19 @@ import SwiftUI
         static let defaultValue = false
     }
 
+    fileprivate struct SpaceHandoff: TransactionKey {
+        static let defaultValue = false
+    }
+
+    /// The native sidebar owns visible travel. Descendant Space transitions must keep
+    /// the covered live content replacement immediate, including in Battery Saver.
+    static func spaceHandoff<T>(_ body: () throws -> T) rethrows -> T {
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        transaction[SpaceHandoff.self] = true
+        return try withTransaction(transaction, body)
+    }
+
     static func space<T>(_ animation: Animation,
                          completionCriteria: AnimationCompletionCriteria = .logicallyComplete,
                          _ body: () throws -> T, completion: @escaping () -> Void = {}) rethrows -> T {
@@ -83,6 +96,10 @@ import SwiftUI
             return count
         }
     }
+}
+
+extension Transaction {
+    var isSpaceHandoff: Bool { self[Motion.SpaceHandoff.self] }
 }
 
 extension View {

@@ -8,7 +8,23 @@ extension Look {
 
 /// Finger samples affect navigation geometry, not the browser or its tab rows.
 @MainActor final class LibraryGesture: ObservableObject {
-    @Published var progress: CGFloat?
+    @Published var progress: CGFloat? {
+        didSet { if progress == nil { pageWidth = nil; pageLeadingInset = nil } }
+    }
+    /// Translate an unchanged page while the fingers move; resize WebKit once at rest.
+    @Published var pageWidth: CGFloat?
+    @Published var pageLeadingInset: CGFloat?
+}
+
+private struct LibraryPageLeadingInset: EnvironmentKey {
+    static let defaultValue: CGFloat? = nil
+}
+
+extension EnvironmentValues {
+    var libraryPageLeadingInset: CGFloat? {
+        get { self[LibraryPageLeadingInset.self] }
+        set { self[LibraryPageLeadingInset.self] = newValue }
+    }
 }
 
 /// Keep the animated geometry in one small observation boundary. The page, sidebar
@@ -29,26 +45,32 @@ struct LibraryNavigationLayout<Page: View, Sidebar: View, Panel: View>: View {
     private var progress: CGFloat { gesture.progress ?? (libraryOpen ? 1 : 0) }
 
     var body: some View {
-        ZStack(alignment: .leading) {
-            HStack(spacing: 0) {
-                Color.clear.frame(width: (sidebarShown ? sidebarWidth : 0)
-                    * (1 - progress) + panelWidth * progress)
-                // Resolve navigation geometry once per surface, rather than per leaf.
-                page.geometryGroup()
-            }
-            .disabled(palettePresented)
-            .accessibilityHidden(palettePresented)
-            // Adjacent surfaces follow the same translation, clipped at the page seam.
-            sidebar
-                .geometryGroup()
-                .offset(x: panelWidth * progress)
-                .frame(width: (sidebarWidth + (floating ? 2 * Look.floatingSidebarGap : 0))
-                    * (1 - progress) + panelWidth * progress, alignment: .leading)
-                .mask {
-                    Rectangle().padding(floating ? -2 * Look.barShadowRadius * (1 - progress) : 0)
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                HStack(spacing: 0) {
+                    Color.clear.frame(width: (sidebarShown ? sidebarWidth : 0)
+                        * (1 - progress) + panelWidth * progress)
+                    // Resolve navigation geometry once per surface, rather than per leaf.
+                    page.environment(\.libraryPageLeadingInset, gesture.pageLeadingInset)
+                        .geometryGroup().frame(width: gesture.pageWidth ?? max(0,
+                        geometry.size.width - ((sidebarShown ? sidebarWidth : 0) * (1 - progress)
+                            + panelWidth * progress)))
                 }
-                .zIndex(1)
-            if libraryOpen || gesture.progress != nil {
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .disabled(palettePresented)
+                .accessibilityHidden(palettePresented)
+                // Adjacent surfaces follow the same translation, clipped at the page seam.
+                sidebar
+                    .geometryGroup()
+                    .offset(x: panelWidth * progress)
+                    .frame(width: (sidebarWidth + (floating ? 2 * Look.floatingSidebarGap : 0))
+                        * (1 - progress) + panelWidth * progress, alignment: .leading)
+                    .mask {
+                        Rectangle().padding(floating ? -2 * Look.barShadowRadius * (1 - progress) : 0)
+                    }
+                    .zIndex(1)
+                // Keep the panel laid out offscreen. Mounting its search field and list
+                // during the first directional sample otherwise stalls that frame.
                 panel
                     .frame(width: panelWidth)
                     .overlay(alignment: .leading) {
@@ -58,8 +80,8 @@ struct LibraryNavigationLayout<Page: View, Sidebar: View, Panel: View>: View {
                     }
                     .geometryGroup()
                     .offset(x: -panelWidth * (1 - progress))
-                    .transition(.offset(x: -panelWidth))
-                    .disabled(palettePresented)
+                    .opacity(libraryOpen || gesture.progress != nil ? 1 : 0)
+                    .disabled(palettePresented || (!libraryOpen && gesture.progress == nil))
                     .allowsHitTesting(libraryOpen && !palettePresented)
                     .accessibilityHidden(!libraryOpen || palettePresented)
                     .zIndex(1)
@@ -191,7 +213,7 @@ private struct LibrarySwipe: ViewModifier {
             Motion.instant(finish)
             clear()
         } else {
-            withAnimation(Look.librarySlide, completionCriteria: .removed, finish, completion: clear)
+            withAnimation(Look.appear, completionCriteria: .removed, finish, completion: clear)
         }
     }
 
@@ -309,6 +331,14 @@ private struct LibrarySwipe: ViewModifier {
                 dragOrigin = store.librarySwipeProgress == nil ? endpoint
                     : (presentedProgress ?? store.librarySwipeProgress ?? endpoint)
                 settlement = UUID()
+                if store.libraryGesture.pageWidth == nil, let window = store.window {
+                    store.libraryGesture.pageLeadingInset = store.sidebarShown || store.libraryOpen ? 0 : Look.cardGap
+                    let origin = dragOrigin ?? endpoint
+                    let leading = (store.sidebarShown ? SidebarWidth.shared.width : 0) * (1 - origin)
+                        + panelWidth * origin
+                    let width = (window.contentView?.bounds.width ?? window.frame.width) - leading
+                    if width > 0 { store.libraryGesture.pageWidth = width }
+                }
             }
             Motion.instant {
                 store.librarySwipeProgress = min(1, max(0, (dragOrigin ?? 0)
