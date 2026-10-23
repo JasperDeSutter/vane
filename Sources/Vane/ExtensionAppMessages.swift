@@ -26,14 +26,24 @@ import WebKit
     private var copies: [ObjectIdentifier: Copy] = [:]
     private let pasteboard: NSPasteboard
     private let sleep: Duration
+    private var saving = false
 
     init(pasteboard: NSPasteboard = .general, sleep: Duration = sleepInterval) {
         self.pasteboard = pasteboard
         self.sleep = sleep
     }
 
+    /// What the browser supplies for one message: who sent it, where a sheet may attach,
+    /// whether the extension is still enabled once the user has answered, and its popup.
+    struct Host {
+        let name: String
+        let window: () -> NSWindow?
+        let isActive: () -> Bool
+        let showPopup: () -> Void
+    }
+
     func answer(_ message: Any, to application: String?, from context: WKWebExtensionContext,
-                showPopup: () -> Void) async throws -> Answer {
+                host: Host) async throws -> Answer {
         guard application == Self.bitwarden, let message = message as? [String: Any],
               let command = message["command"] as? String else { return .unsupported }
         let data = message["data"]
@@ -43,9 +53,8 @@ import WebKit
             return .reply(nil)
         case "copyToClipboard":
             guard context.hasPermission(.clipboardWrite), let text = data as? String else { return .unsupported }
-            pasteboard.clearContents()
-            pasteboard.setString(text, forType: .string)
-            copies[ObjectIdentifier(context)] = Copy(text: text, changeCount: pasteboard.changeCount)
+            // Concealed, as for Vane's own passwords: clipboard managers skip the entry.
+            copies[ObjectIdentifier(context)] = Copy(text: text, changeCount: PasswordClipboard.write(text, to: pasteboard))
             return .reply(nil)
         case "readFromClipboard":
             // Bitwarden reads only to clear the clipboard if it still holds what it copied.
@@ -54,11 +63,15 @@ import WebKit
             let copy = copies[ObjectIdentifier(context)]
             return .reply(copy?.changeCount == pasteboard.changeCount ? copy?.text : "")
         case "showPopover":
-            showPopup()
+            host.showPopup()
             return .reply(nil)
         case "downloadFile":
-            guard let json = data as? String, let file = Self.download(json) else { return .unsupported }
-            await save(file.contents, suggesting: file.name)
+            // One sheet at a time: a second request while one is open is refused rather than
+            // stacking panels the user has to work through.
+            guard !saving, let json = data as? String, let file = Self.download(json) else { return .unsupported }
+            saving = true
+            defer { saving = false }
+            await save(file, for: host)
             return .reply(nil)
         default:
             return .unsupported
@@ -79,15 +92,18 @@ import WebKit
         return (["", ".", "..", "/"].contains(name) ? "Download" : name, contents)
     }
 
-    /// The user picks where an export goes; an extension never writes a file on its own.
-    private func save(_ contents: Data, suggesting name: String) async {
+    /// The user picks where an export goes, on a sheet naming the extension that asked; an
+    /// extension never writes a file on its own.
+    private func save(_ file: (name: String, contents: Data), for host: Host) async {
+        guard let window = host.window() else { return }
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = name
+        panel.nameFieldStringValue = file.name
+        panel.message = "“\(host.name)” wants to save “\(file.name)”."
         let response = await withCheckedContinuation { continuation in
-            panel.begin { continuation.resume(returning: $0) }
+            panel.beginSheetModal(for: window) { continuation.resume(returning: $0) }
         }
-        guard response == .OK, let url = panel.url else { return }
-        do { try contents.write(to: url, options: .atomic) }
+        guard response == .OK, host.isActive(), let url = panel.url else { return }
+        do { try file.contents.write(to: url, options: .atomic) }
         catch { NSLog("Vane: could not save an extension download: \(error.localizedDescription)") }
     }
 }

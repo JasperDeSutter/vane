@@ -221,6 +221,27 @@ extension ExtensionManagedCodeTests {
         XCTAssertEqual(try store.records()[folder.path]?.integratedCapabilities, ["contextMenus"])
     }
 
+    func testAnsweredNativeMessagesRequireApprovalBeforeActivation() async throws {
+        try write(permissions: ["storage", "nativeMessaging"])
+        let (host, _) = try await install()
+        try host.disable(folder.path)
+        let store = ExtensionCodeStore(profileID: profile)
+        var records = try store.records()
+        records[folder.path]?.integratedCapabilities = [] // approved while every native message failed
+        try store.save(records)
+        let again = try await restored()
+        var reviews = 0
+        try await again.setEnabled(true, for: folder.path) { review in
+            reviews += 1
+            XCTAssertEqual(review.newlySupportedCapabilities, ["nativeMessaging"])
+            return false
+        }
+        XCTAssertEqual(reviews, 1)
+        XCTAssertTrue(again.installed.isEmpty, "Declining must keep the extension off")
+        try await again.setEnabled(true, for: folder.path) { _ in true }
+        XCTAssertEqual(try store.records()[folder.path]?.integratedCapabilities, ["nativeMessaging"])
+    }
+
     func testFailedIndexCommitRestartsAcceptedVersionWithoutChangingApproval() async throws {
         let (host, old) = try await install()
         let identity = old.uniqueIdentifier

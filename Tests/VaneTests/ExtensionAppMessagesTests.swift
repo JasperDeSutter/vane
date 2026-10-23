@@ -32,10 +32,11 @@ import XCTest
 
     private func send(_ messages: ExtensionAppMessages, _ command: String, data: Any? = nil,
                       to application: String = ExtensionAppMessages.bitwarden,
-                      from context: WKWebExtensionContext, showPopup: () -> Void = {}) async throws -> ExtensionAppMessages.Answer {
+                      from context: WKWebExtensionContext, showPopup: @escaping () -> Void = {}) async throws -> ExtensionAppMessages.Answer {
         var message: [String: Any] = ["id": "1", "command": command, "responseData": NSNull()]
         message["data"] = data ?? NSNull()
-        return try await messages.answer(message, to: application, from: context, showPopup: showPopup)
+        let host = ExtensionAppMessages.Host(name: "Fixture", window: { nil }, isActive: { true }, showPopup: showPopup)
+        return try await messages.answer(message, to: application, from: context, host: host)
     }
 
     private func reply(_ answer: ExtensionAppMessages.Answer) -> Any?? {
@@ -48,6 +49,7 @@ import XCTest
         let context = try await context(permissions: ["clipboardWrite"])
         _ = try await send(messages, "copyToClipboard", data: "hunter2", from: context)
         XCTAssertEqual(pasteboard.string(forType: .string), "hunter2")
+        XCTAssertTrue(pasteboard.types?.contains(PasswordClipboard.concealed) == true, "Clipboard managers must skip the copy")
         let own = reply(try await send(messages, "readFromClipboard", from: context))
         XCTAssertEqual(own as? String, "hunter2")
         pasteboard.clearContents()
@@ -78,7 +80,7 @@ import XCTest
         let slept = reply(try await send(messages, "sleep", from: context))
         XCTAssertTrue(slept != nil, "answered")
         XCTAssertGreaterThanOrEqual(ContinuousClock.now - started, .milliseconds(200))
-        var shown = 0
+        nonisolated(unsafe) var shown = 0
         let popover = reply(try await send(messages, "showPopover", from: context) { shown += 1 })
         XCTAssertTrue(popover != nil, "answered")
         XCTAssertEqual(shown, 1)

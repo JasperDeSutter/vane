@@ -21,7 +21,8 @@ import WebKit
             "\($0): this WebKit version does not recognize this capability."
         }
         if declared.contains("nativeMessaging") {
-            issues.append("nativeMessaging: Vane does not connect extensions to native applications; their messages fail.")
+            issues.append("nativeMessaging: Vane runs no native applications. It answers some Bitwarden requests itself "
+                + "(copying to the clipboard, opening the popup, saving an export you confirm); other messages fail.")
         }
         if !declared.intersection(["contextMenus", "menus"]).isEmpty {
             issues.append("Page menus are supported; Vane does not yet add extension items to sidebar tab menus.")
@@ -55,13 +56,15 @@ import WebKit
     /// stream that only ever errors, because Safari has no `notifications` API either.
     static let uncaughtScriptErrorCode = 7
 
-    /// `blockingErrors` minus uncaught script errors: those stay visible in the manager but
-    /// do not stop activation.
+    static func isUncaughtScriptError(_ error: any Error) -> Bool {
+        let value = error as NSError
+        return value.domain == WKWebExtensionContext.errorDomain && value.code == uncaughtScriptErrorCode
+    }
+
+    /// `blockingErrors` minus uncaught script errors: those stay visible in the manager as
+    /// warnings but do not stop activation.
     static func activationErrors(_ errors: [any Error], manifest: [String: Any]) -> [any Error] {
-        blockingErrors(errors, manifest: manifest).filter { error in
-            let value = error as NSError
-            return !(value.domain == WKWebExtensionContext.errorDomain && value.code == uncaughtScriptErrorCode)
-        }
+        blockingErrors(errors, manifest: manifest).filter { !isUncaughtScriptError($0) }
     }
 
     /// WebKit can parse a manifest while deferring resource errors until first use.

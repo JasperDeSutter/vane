@@ -109,7 +109,9 @@ import WebKit
     private let codeStore: ExtensionCodeStore
     private var records: [String: ExtensionCodeStore.Record] = [:]
     private var metadataFailure: String?
-    private static let integratedCapabilities: Set<String> = ["contextMenus", "menus"]
+    /// Capabilities that started doing something after an extension was approved, so the
+    /// next load asks again. Native messages used to fail; Vane now answers some of them.
+    private static let integratedCapabilities: Set<String> = ["contextMenus", "menus", "nativeMessaging"]
     private var metadataIcons: [String: NSImage] = [:]
     private struct LegacyMetadata {
         var version: String
@@ -127,7 +129,11 @@ import WebKit
             let record = records[path]
             let source = sourceFolder(for: path)
             let busy = operations[path] != nil || restoring[path] != nil
-            let runtimeErrors = context.map { ExtensionDiagnostics.blockingErrors($0.errors, manifest: $0.webExtension.manifest) } ?? []
+            let reported = context.map { ExtensionDiagnostics.blockingErrors($0.errors, manifest: $0.webExtension.manifest) } ?? []
+            let runtimeErrors = reported.filter { !ExtensionDiagnostics.isUncaughtScriptError($0) }
+            // Expected in some packages and harmless to the rest: shown, but not a failure.
+            let scriptWarnings = reported.filter(ExtensionDiagnostics.isUncaughtScriptError)
+                .map { "Script error: " + ($0 as NSError).localizedDescription }
             let failure = failures[path] ?? (runtimeErrors.isEmpty ? nil : ExtensionDiagnostics.describe(runtimeErrors))
             return Entry(path: path, name: record?.name ?? folders[path] ?? URL(fileURLWithPath: path).lastPathComponent,
                          context: context, status: busy ? "Checking…" : failure != nil ? (context != nil ? "Update needs attention" : "Needs attention")
@@ -141,7 +147,7 @@ import WebKit
                          sourcePath: source.path,
                          requiredAccess: record?.required ?? ExtensionConsent.saved(for: URL(fileURLWithPath: path), profileID: profileID),
                          optionalAccess: record?.optional ?? legacyMetadata[path]?.optional,
-                         compatibility: record?.compatibility ?? limitations[path] ?? [])
+                         compatibility: (record?.compatibility ?? limitations[path] ?? []) + scriptWarnings)
         }
     }
 
@@ -1109,9 +1115,22 @@ import WebKit
     func webExtensionController(_ controller: WKWebExtensionController, sendMessage message: Any,
                                 toApplicationWithIdentifier applicationIdentifier: String?,
                                 for extensionContext: WKWebExtensionContext) async throws -> Any? {
-        let answer = try await appMessages.answer(message, to: applicationIdentifier, from: extensionContext) {
-            run(extensionContext, for: nil, from: nil)
+        try requireActive(extensionContext)
+        // Only a window this extension may act in: never a private one it has no access to.
+        let store = { [weak self] () -> TabStore? in
+            guard let store = self?.myFocusedStore,
+                  extensionContext.hasAccessToPrivateData || !store.isPrivate else { return nil }
+            return store
         }
+        let host = ExtensionAppMessages.Host(
+            name: extensionContext.webExtension.displayName ?? "An extension",
+            window: { store()?.window },
+            isActive: { [weak self] in (try? self?.requireActive(extensionContext)) != nil },
+            showPopup: { [weak self] in
+                guard let store = store() else { return }
+                self?.run(extensionContext, for: store.active, from: nil)
+            })
+        let answer = try await appMessages.answer(message, to: applicationIdentifier, from: extensionContext, host: host)
         if case .reply(let reply) = answer { return reply }
         try await Task.sleep(for: ExtensionDiagnostics.nativeMessageFailureDelay)
         throw Failure("Vane does not connect extensions to native applications.")

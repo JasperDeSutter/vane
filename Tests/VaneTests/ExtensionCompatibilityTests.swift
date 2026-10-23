@@ -209,7 +209,9 @@ import XCTest
         let reply = try await web.callAsyncJavaScript("return await browser.runtime.sendMessage({});",
             arguments: [:], in: nil, contentWorld: .page) as? String
         XCTAssertEqual(reply, "alive")
-        XCTAssertTrue(host.entries.first?.failure?.contains("Fixture background failure") == true)
+        // Shown as a warning, not as a failure that needs attention.
+        XCTAssertNil(host.entries.first?.failure)
+        XCTAssertTrue(host.entries.first?.compatibility.contains { $0.contains("Fixture background failure") } == true)
         host.remove(context)
     }
 
