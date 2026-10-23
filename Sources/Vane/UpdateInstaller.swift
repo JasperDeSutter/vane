@@ -13,7 +13,7 @@ import Foundation
 
 enum UpdateInstaller {
     // Stable XPC wire values, matching BundleReplacement.Launch.
-    enum Launch: Int { case unchanged = 0, waitingForHealth = 1, rolledBack = 2, needsAttention = 3 }
+    enum Launch: Int, Sendable { case unchanged = 0, waitingForHealth = 1, rolledBack = 2, needsAttention = 3 }
     static let serviceName = "io.github.notnaki.vane.UpdateInstaller"
     static let teamID = "T7X84HN3W3"
     static func requirement(identifier: String) -> String {

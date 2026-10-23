@@ -15,7 +15,7 @@ enum BundleReplacement {
              afterHealthyJournal, beforeCleanup, afterCleanup
     }
     // Stable wire values also decoded by the browser's UpdateInstaller client.
-    enum Launch: Int { case unchanged = 0, waitingForHealth = 1, rolledBack = 2, needsAttention = 3 }
+    enum Launch: Int, Sendable { case unchanged = 0, waitingForHealth = 1, rolledBack = 2, needsAttention = 3 }
 
     /// The service derives this identity from its authenticated XPC connection. Keeping
     /// the validity check live prevents an exited/reused PID or a displaced executable

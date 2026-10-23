@@ -468,6 +468,7 @@ extension Release {
     static let shared = Updater()
     static let repo = "notnaki/vane"
     private static var launchedReplacement = false
+    private static let launchWorker = BackupWorker()
 
     static var currentVersion: String {
         (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.1.0"
@@ -859,11 +860,16 @@ extension Release {
 
     /// Reconcile a transaction before any window opens. A replacement that crashed during
     /// its previous launch is rolled back while its old bundle is still retained.
-    static func recoverAtLaunch() {
-        guard isBundled, BundleReplacement.hasRecoveryWork(at: Bundle.main.bundleURL) else { return }
+    static func recoverAtLaunch() async {
+        guard isBundled else { return }
+        let target = Bundle.main.bundleURL
         let launch: UpdateInstaller.Launch
-        do { launch = try UpdateInstaller.beginLaunch(target: Bundle.main.bundleURL) }
-        catch {
+        do {
+            launch = try await launchWorker.run {
+                guard BundleReplacement.hasRecoveryWork(at: target) else { return .unchanged }
+                return try UpdateInstaller.beginLaunch(target: target)
+            }
+        } catch {
             NSLog("[vane] pending update recovery helper unavailable: %@", error.localizedDescription)
             exit(1)
         }
@@ -889,7 +895,7 @@ extension Release {
                 exit(1)
             }
             do {
-                try launchAfterExit(Bundle.main.bundleURL, recoverUnlaunched: false)
+                try await launchAfterExit(Bundle.main.bundleURL, recoverUnlaunched: false)
                 exit(0)
             } catch {
                 NSLog("[vane] update: old bundle restored, but relaunch failed: %@",
@@ -902,10 +908,12 @@ extension Release {
     /// Called only by the process that observed a pending replacement at its own startup.
     /// The old process may still be running from the same bundle path after the swap; it
     /// must never mark the new copy healthy or delete its own backup on termination.
-    static func markHealthyLaunch() {
+    static func markHealthyLaunchAsync() async {
         guard isBundled, launchedReplacement else { return }
+        let target = Bundle.main.bundleURL
         do {
-            guard try UpdateInstaller.markHealthy(target: Bundle.main.bundleURL) else {
+            let healthy = try await launchWorker.run { try UpdateInstaller.markHealthy(target: target) }
+            guard healthy else {
                 NSLog("[vane] update: helper did not accept launch health confirmation")
                 return
             }
@@ -933,31 +941,42 @@ extension Release {
     /// inherits the browser sandbox and cannot perform recovery in Applications.
     /// After recovery already restored an older bundle, a read-only open-after-exit
     /// script remains compatible with older helpers lacking the new XPC protocol.
-    private static func launchAfterExit(_ target: URL, recoverUnlaunched: Bool = true) throws {
+    private static func launchAfterExit(_ target: URL, recoverUnlaunched: Bool = true) async throws {
+        let isolatedDirectory = Store.overrideDirectory
         if recoverUnlaunched {
-            try UpdateInstaller.scheduleRelaunch(target: target, isolatedDirectory: Store.overrideDirectory)
+            try await launchWorker.run {
+                try UpdateInstaller.scheduleRelaunch(target: target, isolatedDirectory: isolatedDirectory)
+            }
             return
         }
         let script = UpdateRelaunch.script(parentPID: getpid(), target: target,
-                                          isolatedDirectory: Store.overrideDirectory)
-        let helper = Process()
-        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
-        helper.arguments = ["-c", script]
-        try helper.run()
+                                          isolatedDirectory: isolatedDirectory)
+        try await launchWorker.run {
+            let helper = Process()
+            helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+            helper.arguments = ["-c", script]
+            try helper.run()
+        }
     }
 
+    private var restarting = false
     func restart() {
+        guard !restarting else { return }
+        restarting = true
         let target = installed ?? Bundle.main.bundleURL
-        do {
-            try Self.launchAfterExit(target)
-        } catch {
-            // Could not even start the helper: stay alive and usable rather than quitting
-            // into nothing. The update is installed — it just needs a manual relaunch.
-            NSLog("[vane] relaunch helper failed: \(error.localizedDescription)")
-            Toasts.stick("Update installed — quit and reopen Vane", id: toastID)
-            return
+        Task { [self] in
+            defer { restarting = false }
+            do {
+                try await Self.launchAfterExit(target)
+            } catch {
+                // The supervisor must accept the relaunch before this process quits.
+                // Preserve the installed update and keep the browser usable on failure.
+                NSLog("[vane] relaunch helper failed: \(error.localizedDescription)")
+                Toasts.stick("Update installed — quit and reopen Vane", id: toastID)
+                return
+            }
+            NSApp.terminate(nil)
         }
-        NSApp.terminate(nil)
     }
 
     // MARK: - The toast

@@ -18,7 +18,7 @@ enum BackupSchedule {
     }
 }
 
-@MainActor struct BackupRecovery {
+struct BackupRecovery: Sendable {
     let library: BackupLibrary
     private nonisolated let writer: @Sendable (BackupArchive, URL) throws -> Void
     private nonisolated let remover: @Sendable (URL) throws -> Void
@@ -62,12 +62,7 @@ enum BackupSchedule {
         return try finishSave(archive)
     }
     func saveAsync(_ archive: BackupArchive) async throws -> BackupPoint {
-        try BackupCodec.validate(archive)
-        if archive.damage == nil { _ = try library.validate(archive) }
-        return try await Task.detached(priority: .utility) {
-            try self.writePoint(archive)
-            return try self.finishSave(archive)
-        }.value
+        try await Task.detached(priority: .utility) { try save(archive) }.value
     }
     private nonisolated func writePoint(_ archive: BackupArchive) throws {
         try BackupIO.directory(root); try BackupIO.directory(pointRoot)
@@ -105,6 +100,28 @@ enum BackupSchedule {
         let retained = Set(kept.map(\.id))
         for stale in all where !retained.contains(stale.id) { try remover(stale.url) }
     }
+    /// SHM is a transient SQLite index, not a committed user-data generation. Keep
+    /// the earliest raw evidence when repeated inspection changed only that index.
+    /// A real database/WAL, file or preference edit still earns a separate point.
+    func beforeRestorePointIfChanged(_ archive: BackupArchive) throws -> BackupPoint? {
+        guard archive.damage != nil else { return try automaticPointIfChanged(archive) }
+        if let latest = try points().first(where: { $0.reason == .beforeRestore }),
+           let previous = try? BackupCodec.read(latest.url), previous.damage != nil,
+           try Self.rawEvidenceDigest(previous) == Self.rawEvidenceDigest(archive) {
+            try reconcileRetention(keeping: latest.id)
+            return nil
+        }
+        return try save(archive)
+    }
+    private static func rawEvidenceDigest(_ archive: BackupArchive) throws -> Data {
+        var hash = SHA256()
+        try hashValue(PropertyListSerialization.propertyList(from: archive.preferences, format: nil), into: &hash)
+        for file in archive.files.sorted(by: { $0.name < $1.name }) where !file.name.hasSuffix(".db-shm") {
+            try hashValue(file.name, into: &hash)
+            try hashValue(file.data, into: &hash)
+        }
+        return Data(hash.finalize())
+    }
     func automaticPointIfChanged(_ archive: BackupArchive) throws -> BackupPoint? {
         _ = try library.validate(archive)
         let digest = try Self.contentDigest(archive)
@@ -117,18 +134,7 @@ enum BackupSchedule {
         return try save(archive)
     }
     func automaticPointIfChangedAsync(_ archive: BackupArchive) async throws -> BackupPoint? {
-        _ = try library.validate(archive)
-        let changed = try await Task.detached(priority: .utility) {
-            let digest = try Self.contentDigest(archive)
-            if let latest = try self.points().first(where: { $0.diagnostic == nil }) {
-                if digest == (try Self.contentDigest(BackupCodec.read(latest.url))) {
-                    try self.reconcileRetention(keeping: latest.id)
-                    return false
-                }
-            }
-            return true
-        }.value
-        return changed ? try await saveAsync(archive) : nil
+        try await Task.detached(priority: .utility) { try automaticPointIfChanged(archive) }.value
     }
     nonisolated static func contentDigest(_ archive: BackupArchive) throws -> String {
         var hash = SHA256()

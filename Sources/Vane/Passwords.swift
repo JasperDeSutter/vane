@@ -167,20 +167,24 @@ enum Passwords {
 
     static func saveChecked(origin: PasswordOrigin, account: String, password: String,
                             profileID: UUID, replacingExisting: Bool = true) throws {
-        defer { invalidate() }
-        guard origin != IntegrationTokens.legacyOrigin else { throw Failure(status: errSecParam) }
-        var add = query(origin: origin, account: account, profileID: profileID)
-        if !origin.isDefaultPort { add[kSecAttrPort as String] = origin.port }
-        add[kSecValueData as String] = Data(password.utf8)
-        add[kSecAttrLabel as String] = "\(origin.url.absoluteString) (Vane)"
-        let status = SecItemAdd(add as CFDictionary, nil)
-        if status == errSecSuccess { return }
-        guard status == errSecDuplicateItem, replacingExisting else { throw Failure(status: status) }
-        guard let existing = try referenceChecked(origin: origin, account: account, profileID: profileID)
-        else { throw Failure(status: status) }
-        let updated = SecItemUpdate([kSecValuePersistentRef as String: existing] as CFDictionary,
-                                    [kSecValueData as String: Data(password.utf8)] as CFDictionary)
-        guard updated == errSecSuccess else { throw Failure(status: updated) }
+        return try serviceLane.sync {
+            defer { invalidate() }
+            guard origin != IntegrationTokens.legacyOrigin else { throw Failure(status: errSecParam) }
+            var add = query(origin: origin, account: account, profileID: profileID)
+            if !origin.isDefaultPort { add[kSecAttrPort as String] = origin.port }
+            add[kSecValueData as String] = Data(password.utf8)
+            add[kSecAttrLabel as String] = "\(origin.url.absoluteString) (Vane)"
+            try checkServiceCancellation()
+            let status = SecItemAdd(add as CFDictionary, nil)
+            if status == errSecSuccess { return }
+            guard status == errSecDuplicateItem, replacingExisting else { throw Failure(status: status) }
+            guard let existing = try referenceChecked(origin: origin, account: account, profileID: profileID)
+            else { throw Failure(status: status) }
+            try checkServiceCancellation()
+            let updated = SecItemUpdate([kSecValuePersistentRef as String: existing] as CFDictionary,
+                                        [kSecValueData as String: Data(password.utf8)] as CFDictionary)
+            guard updated == errSecSuccess else { throw Failure(status: updated) }
+        }
     }
 
     /// Keychain changes the identity in place and refuses primary-key collisions. No
@@ -188,21 +192,24 @@ enum Passwords {
     /// its opaque reference when primary-key attributes change.
     static func editChecked(_ login: Login, origin: PasswordOrigin, account: String,
                             password: String, profileID: UUID) throws {
-        defer { invalidate() }
-        guard origin != IntegrationTokens.legacyOrigin, login.origin != IntegrationTokens.legacyOrigin
-        else { throw Failure(status: errSecParam) }
-        guard let ref = try referenceChecked(origin: login.origin, account: login.account, profileID: profileID)
-        else { throw Failure(status: errSecItemNotFound) }
-        let status = SecItemUpdate([kSecValuePersistentRef as String: ref] as CFDictionary, [
-            kSecAttrServer as String: origin.host, kSecAttrProtocol as String: origin.keychainProtocol,
-            kSecAttrPort as String: origin.isDefaultPort ? 0 : origin.port,
-            kSecAttrAccount as String: account, kSecValueData as String: Data(password.utf8),
-            kSecAttrLabel as String: "\(origin.url.absoluteString) (Vane)",
-        ] as CFDictionary)
-        guard status == errSecSuccess else { throw Failure(status: status) }
-        if origin == login.origin {
-            renameUse(origin: origin, from: login.account, to: account, profileID: profileID)
-        } else { forgetUse(origin: login.origin, account: login.account, profileID: profileID) }
+        return try serviceLane.sync {
+            defer { invalidate() }
+            guard origin != IntegrationTokens.legacyOrigin, login.origin != IntegrationTokens.legacyOrigin
+            else { throw Failure(status: errSecParam) }
+            guard let ref = try referenceChecked(origin: login.origin, account: login.account, profileID: profileID)
+            else { throw Failure(status: errSecItemNotFound) }
+            try checkServiceCancellation()
+            let status = SecItemUpdate([kSecValuePersistentRef as String: ref] as CFDictionary, [
+                kSecAttrServer as String: origin.host, kSecAttrProtocol as String: origin.keychainProtocol,
+                kSecAttrPort as String: origin.isDefaultPort ? 0 : origin.port,
+                kSecAttrAccount as String: account, kSecValueData as String: Data(password.utf8),
+                kSecAttrLabel as String: "\(origin.url.absoluteString) (Vane)",
+            ] as CFDictionary)
+            guard status == errSecSuccess else { throw Failure(status: status) }
+            if origin == login.origin {
+                renameUse(origin: origin, from: login.account, to: account, profileID: profileID)
+            } else { forgetUse(origin: login.origin, account: login.account, profileID: profileID) }
+        }
     }
 
     /// Nil when nothing is stored. With several accounts for one host this is the one the
@@ -215,13 +222,13 @@ enum Passwords {
         return (hit.account, secret)
     }
 
-    enum CredentialRead {
+    enum CredentialRead: Sendable {
         case found(account: String, password: String)
         case missing
         case unavailable(OSStatus)
     }
 
-    enum CredentialCleanup {
+    enum CredentialCleanup: Sendable {
         case complete
         case unavailable(OSStatus)
     }
@@ -264,6 +271,7 @@ enum Passwords {
         guard origin != IntegrationTokens.legacyOrigin else { return nil }
         guard let ref = try referenceChecked(origin: origin, account: account, profileID: profileID, copyMatching: copyMatching)
         else { return nil }
+        try checkServiceCancellation()
         var out: CFTypeRef?
         let status = copyMatching([
             kSecClass as String: kSecClassInternetPassword,
@@ -301,11 +309,12 @@ enum Passwords {
     static func all(profileID: UUID = ProfileManager.activeProfileID) -> [Login] {
         cacheLock.lock()
         let hit = cached[profileID]
+        let revision = cacheRevision
         cacheLock.unlock()
         if let hit { return hit }
         guard let fresh = try? allChecked(profileID: profileID) else { return [] }
         cacheLock.lock()
-        cached[profileID] = fresh
+        if cacheRevision == revision { cached[profileID] = fresh }
         cacheLock.unlock()
         return fresh
     }
@@ -315,51 +324,55 @@ enum Passwords {
     static func exportEntries(profileID: UUID,
                               copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemCopyMatching)
         throws -> [PasswordImport.Entry] {
-        var q: [String: Any] = [
-            kSecClass as String: kSecClassInternetPassword,
-            kSecAttrCreator as String: creator,
-            kSecReturnAttributes as String: true,
-            kSecReturnPersistentRef as String: true,
-            kSecMatchLimit as String: kSecMatchLimitAll,
-        ]
-        let scope = domain(profileID)
-        if let scope { q[kSecAttrSecurityDomain as String] = scope }
-        var out: CFTypeRef?
-        let status = copyMatching(q as CFDictionary, &out)
-        if status == errSecItemNotFound { return [] }
-        guard status == errSecSuccess, let items = out as? [[String: Any]] else {
-            throw PasswordImport.Failure("Could not read saved passwords from Keychain. No file was exported.")
-        }
-        var entries: [PasswordImport.Entry] = []
-        for item in items where owns(scope: scope, itemDomain: item[kSecAttrSecurityDomain as String] as? String) {
-            if PasswordOrigin(attributes: item) == IntegrationTokens.legacyOrigin { continue }
-            guard let origin = PasswordOrigin(attributes: item),
-                  let ref = item[kSecValuePersistentRef as String] as? Data else {
-                throw PasswordImport.Failure("A saved login has unsupported attributes. No file was exported.")
-            }
-            var secret: CFTypeRef?
-            let read = copyMatching([
+        return try serviceLane.sync {
+            var q: [String: Any] = [
                 kSecClass as String: kSecClassInternetPassword,
-                kSecValuePersistentRef as String: ref,
-                kSecReturnData as String: true,
-            ] as CFDictionary, &secret)
-            guard read == errSecSuccess, let data = secret as? Data,
-                  let password = String(data: data, encoding: .utf8) else {
-                throw PasswordImport.Failure("Could not read every saved password from Keychain. No file was exported.")
+                kSecAttrCreator as String: creator,
+                kSecReturnAttributes as String: true,
+                kSecReturnPersistentRef as String: true,
+                kSecMatchLimit as String: kSecMatchLimitAll,
+            ]
+            let scope = domain(profileID)
+            if let scope { q[kSecAttrSecurityDomain as String] = scope }
+            var out: CFTypeRef?
+            let status = copyMatching(q as CFDictionary, &out)
+            if status == errSecItemNotFound { return [] }
+            guard status == errSecSuccess, let items = out as? [[String: Any]] else {
+                throw PasswordImport.Failure("Could not read saved passwords from Keychain. No file was exported.")
             }
-            entries.append(PasswordImport.Entry(origin: origin,
-                account: item[kSecAttrAccount as String] as? String ?? "", password: password))
+            var entries: [PasswordImport.Entry] = []
+            for item in items where owns(scope: scope, itemDomain: item[kSecAttrSecurityDomain as String] as? String) {
+                if PasswordOrigin(attributes: item) == IntegrationTokens.legacyOrigin { continue }
+                guard let origin = PasswordOrigin(attributes: item),
+                      let ref = item[kSecValuePersistentRef as String] as? Data else {
+                    throw PasswordImport.Failure("A saved login has unsupported attributes. No file was exported.")
+                }
+                var secret: CFTypeRef?
+                let read = copyMatching([
+                    kSecClass as String: kSecClassInternetPassword,
+                    kSecValuePersistentRef as String: ref,
+                    kSecReturnData as String: true,
+                ] as CFDictionary, &secret)
+                guard read == errSecSuccess, let data = secret as? Data,
+                      let password = String(data: data, encoding: .utf8) else {
+                    throw PasswordImport.Failure("Could not read every saved password from Keychain. No file was exported.")
+                }
+                entries.append(PasswordImport.Entry(origin: origin,
+                    account: item[kSecAttrAccount as String] as? String ?? "", password: password))
+            }
+            return entries.sorted { ($0.origin.url.absoluteString, $0.account) < ($1.origin.url.absoluteString, $1.account) }
         }
-        return entries.sorted { ($0.origin.url.absoluteString, $0.account) < ($1.origin.url.absoluteString, $1.account) }
     }
 
     /// `nonisolated(unsafe)` plus an explicit lock, for the same reason `UserDefaults.vane`
     /// is: the keychain is reachable from any thread and this is only a read-through copy.
     private nonisolated(unsafe) static var cached: [UUID: [Login]] = [:]
+    private nonisolated(unsafe) static var cacheRevision: UInt64 = 0
     private static let cacheLock = NSLock()
 
     private static func invalidate() {
         cacheLock.lock()
+        cacheRevision &+= 1
         cached.removeAll()
         cacheLock.unlock()
     }
@@ -403,16 +416,19 @@ enum Passwords {
     }
 
     static func deleteChecked(origin: PasswordOrigin, account: String, profileID: UUID) throws {
-        defer { invalidate() }
-        guard let ref = try referenceChecked(origin: origin, account: account, profileID: profileID)
-        else { throw Failure(status: errSecItemNotFound) }
-        let status = SecItemDelete([kSecClass as String: kSecClassInternetPassword,
-                                   kSecValuePersistentRef as String: ref] as CFDictionary)
-        guard status == errSecSuccess else { throw Failure(status: status) }
-        forgetUse(origin: origin, account: account, profileID: profileID)
+        return try serviceLane.sync {
+            defer { invalidate() }
+            guard let ref = try referenceChecked(origin: origin, account: account, profileID: profileID)
+            else { throw Failure(status: errSecItemNotFound) }
+            try checkServiceCancellation()
+            let status = SecItemDelete([kSecClass as String: kSecClassInternetPassword,
+                                       kSecValuePersistentRef as String: ref] as CFDictionary)
+            guard status == errSecSuccess else { throw Failure(status: status) }
+            forgetUse(origin: origin, account: account, profileID: profileID)
+        }
     }
 
-    struct Revision: Equatable {
+    struct Revision: Equatable, Sendable {
         let reference: Data
         let modified: Date?
     }
@@ -425,6 +441,194 @@ enum Passwords {
         guard status == errSecSuccess else { throw Failure(status: status) }
         guard let attrs = out as? [String: Any] else { throw Failure(status: errSecDecode) }
         return Revision(reference: ref, modified: attrs[kSecAttrModificationDate as String] as? Date)
+    }
+
+    /// Every in-app mutation and reviewed check/write enters this one queue. Sync entry
+    /// is retained for CLI/fixtures and already-detached import batches; UI uses perform.
+    private final class ServiceLane: @unchecked Sendable {
+        let queue = DispatchQueue(label: "app.vane.password-service", qos: .userInitiated)
+        let key = DispatchSpecificKey<Bool>()
+        let cancellationKey = DispatchSpecificKey<Cancellation>()
+        init() { queue.setSpecific(key: key, value: true) }
+        func sync<Value>(_ operation: () throws -> Value) rethrows -> Value {
+            if DispatchQueue.getSpecific(key: key) == true { return try operation() }
+            return try queue.sync(execute: operation)
+        }
+    }
+    private final class Cancellation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        func cancel() { lock.withLock { value = true } }
+        var cancelled: Bool { lock.withLock { value } }
+    }
+    private static let serviceLane = ServiceLane()
+
+    static func serialized<Value>(_ operation: () throws -> Value) rethrows -> Value {
+        try serviceLane.sync(operation)
+    }
+
+    static func perform<Value: Sendable>(_ operation: @escaping @Sendable () throws -> Value) async throws -> Value {
+        let cancellation = Cancellation()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            let result: Value = try await withCheckedThrowingContinuation { continuation in
+                serviceLane.queue.async {
+                    guard !cancellation.cancelled else { continuation.resume(throwing: CancellationError()); return }
+                    serviceLane.queue.setSpecific(key: serviceLane.cancellationKey, value: cancellation)
+                    defer { serviceLane.queue.setSpecific(key: serviceLane.cancellationKey, value: nil) }
+                    do {
+                        let result = try operation()
+                        if cancellation.cancelled { continuation.resume(throwing: CancellationError()) }
+                        else { continuation.resume(returning: result) }
+                    } catch { continuation.resume(throwing: error) }
+                }
+            }
+            try Task.checkCancellation()
+            return result
+        } onCancel: { cancellation.cancel() }
+    }
+
+    /// Register synchronously on the UI actor before launching a task, closing the gap
+    /// between a Save click and its eventual service-queue admission.
+    struct PendingUIOperation: Sendable {
+        fileprivate let id: UUID
+        @MainActor func finish() { Passwords.finishUIOperation(id) }
+    }
+    @MainActor private static var pendingUIOperations: Set<UUID> = []
+    @MainActor private static var pendingUIWaiters: [CheckedContinuation<Void, Never>] = []
+    @MainActor static var hasPendingOperations: Bool { !pendingUIOperations.isEmpty }
+
+    @MainActor static func beginUIOperation() -> PendingUIOperation? {
+        guard !AppLifecycle.shared.persistenceExitInProgress else { return nil }
+        let id = UUID()
+        pendingUIOperations.insert(id)
+        return PendingUIOperation(id: id)
+    }
+    @MainActor private static func finishUIOperation(_ id: UUID) {
+        guard pendingUIOperations.remove(id) != nil, pendingUIOperations.isEmpty else { return }
+        let waiters = pendingUIWaiters
+        pendingUIWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    /// Caller closes new intent first, then drains imports before this barrier. No UI
+    /// thread waits on queue.sync; admitted UI tasks may reach the lane after this starts.
+    @MainActor static func flushPendingOperations() async throws {
+        while true {
+            if !pendingUIOperations.isEmpty {
+                await withCheckedContinuation { pendingUIWaiters.append($0) }
+            }
+            try Task.checkCancellation()
+            try await perform { }
+            if pendingUIOperations.isEmpty { return }
+        }
+    }
+
+    static func checkServiceCancellation() throws {
+        try Task.checkCancellation()
+        if DispatchQueue.getSpecific(key: serviceLane.cancellationKey)?.cancelled == true {
+            throw CancellationError()
+        }
+    }
+
+    struct MutationOperations: Sendable {
+        var add: @Sendable (PasswordOrigin, String, String, UUID) throws -> Void = {
+            try saveChecked(origin: $0, account: $1, password: $2, profileID: $3, replacingExisting: false)
+        }
+        var edit: @Sendable (Login, PasswordOrigin, String, String, UUID) throws -> Void = {
+            try editChecked($0, origin: $1, account: $2, password: $3, profileID: $4)
+        }
+        var delete: @Sendable (Login, UUID) throws -> Void = {
+            try deleteChecked(origin: $0.origin, account: $0.account, profileID: $1)
+        }
+    }
+    static func addAsync(origin: PasswordOrigin, account: String, password: String, profileID: UUID,
+                         operations: MutationOperations = .init()) async throws {
+        try await perform { try operations.add(origin, account, password, profileID) }
+    }
+    static func editAsync(_ login: Login, origin: PasswordOrigin, account: String, password: String,
+                          profileID: UUID, operations: MutationOperations = .init()) async throws {
+        try await perform { try operations.edit(login, origin, account, password, profileID) }
+    }
+    static func deleteAsync(_ login: Login, profileID: UUID,
+                            operations: MutationOperations = .init()) async throws {
+        try await perform { try operations.delete(login, profileID) }
+    }
+
+    struct ReviewOperations: Sendable {
+        var snapshot: @Sendable (PasswordOrigin, String, UUID) throws -> (String?, Revision?) = {
+            let password = try passwordChecked(origin: $0, account: $1, profileID: $2)
+            try checkServiceCancellation()
+            return (password, try revision(origin: $0, account: $1, profileID: $2))
+        }
+        var update: @Sendable (Login, PasswordOrigin, String, String, UUID) throws -> Void = {
+            try editChecked($0, origin: $1, account: $2, password: $3, profileID: $4)
+        }
+        var insert: @Sendable (PasswordOrigin, String, String, UUID) throws -> Void = {
+            try saveChecked(origin: $0, account: $1, password: $2, profileID: $3, replacingExisting: false)
+        }
+    }
+
+    enum SaveDecision: Sendable {
+        case saved
+        case review(PendingSave)
+    }
+
+    static func reviewedSave(_ offer: PendingSave, origin: PasswordOrigin, account: String,
+                             password: String, profileID: UUID,
+                             operations: ReviewOperations = .init()) throws -> SaveDecision {
+        return try serviceLane.sync {
+            let (existing, revision) = try operations.snapshot(origin, account, profileID)
+            let sameIdentity = origin == offer.origin && account == offer.account
+            if existing != nil && (!offer.update || !sameIdentity || (offer.revision != nil && offer.revision != revision)) {
+                return .review(PendingSave(attempt: offer.attempt, revision: revision, port: origin.port,
+                    host: origin.host, account: account, password: password, update: true))
+            }
+            try checkServiceCancellation()
+            if offer.update && sameIdentity {
+                guard existing != nil else { throw Failure(status: errSecItemNotFound) }
+                try operations.update(.init(origin: origin, account: account), origin, account, password, profileID)
+            } else {
+                try operations.insert(origin, account, password, profileID)
+            }
+            return .saved
+        }
+    }
+
+    /// Immutable injected operations keep Keychain calls on the worker while UI callers
+    /// retain the profile, document and account authorization around every suspension.
+    struct Reader: Sendable {
+        var matches: @Sendable (PasswordOrigin, UUID) throws -> [Login] = {
+            try matchesChecked(origin: $0, profileID: $1)
+        }
+        var password: @Sendable (PasswordOrigin, String, UUID) throws -> String? = {
+            try passwordChecked(origin: $0, account: $1, profileID: $2)
+        }
+        var revision: @Sendable (PasswordOrigin, String, UUID) throws -> Revision? = {
+            try Passwords.revision(origin: $0, account: $1, profileID: $2)
+        }
+
+        var commit: @Sendable (PendingSave, PasswordOrigin, String, String, UUID) throws -> SaveDecision = {
+            try reviewedSave($0, origin: $1, account: $2, password: $3, profileID: $4)
+        }
+
+        func save(_ offer: PendingSave, origin: PasswordOrigin, account: String,
+                  password: String, profileID: UUID) async throws -> SaveDecision {
+            try await perform { try commit(offer, origin, account, password, profileID) }
+        }
+        func logins(origin: PasswordOrigin, profileID: UUID) async throws -> [Login] {
+            try await perform { try matches(origin, profileID) }
+        }
+        func secret(_ login: Login, profileID: UUID) async throws -> String? {
+            try await perform { try password(login.origin, login.account, profileID) }
+        }
+        func saved(origin: PasswordOrigin, account: String, profileID: UUID) async throws -> (String?, Revision?) {
+            try await perform {
+                let saved = try password(origin, account, profileID)
+                try checkServiceCancellation()
+                return (saved, try revision(origin, account, profileID))
+            }
+        }
     }
 
     // MARK: Last used
@@ -536,19 +740,23 @@ enum Passwords {
     /// Enumerate metadata first, then delete exact owned references, including legacy tokens.
     static func deleteEverything(dataDir: String? = Store.overrideDirectory,
                                  keychain: IntegrationTokens.Keychain = .system) {
-        defer { invalidate() }
-        guard deleteOwnedInternetPasswords(profileID: nil, dataDir: dataDir, keychain: keychain) else { return }
-        if !IntegrationTokens.deleteEverything(dataDir: dataDir, keychain: keychain) {
-            NSLog("[vane] Native integration credentials could not be erased")
+        return serialized {
+            defer { invalidate() }
+            guard deleteOwnedInternetPasswords(profileID: nil, dataDir: dataDir, keychain: keychain) else { return }
+            if !IntegrationTokens.deleteEverything(dataDir: dataDir, keychain: keychain) {
+                NSLog("[vane] Native integration credentials could not be erased")
+            }
         }
     }
 
     static func deleteAll(profileID: UUID, dataDir: String? = Store.overrideDirectory,
                           keychain: IntegrationTokens.Keychain = .system) {
-        defer { invalidate() }
-        guard deleteOwnedInternetPasswords(profileID: profileID, dataDir: dataDir, keychain: keychain) else { return }
-        if !IntegrationTokens(profileID: profileID, dataDir: dataDir, keychain: keychain, lastUsed: [:]).deleteAll() {
-            NSLog("[vane] Profile integration credentials could not be erased")
+        return serialized {
+            defer { invalidate() }
+            guard deleteOwnedInternetPasswords(profileID: profileID, dataDir: dataDir, keychain: keychain) else { return }
+            if !IntegrationTokens(profileID: profileID, dataDir: dataDir, keychain: keychain, lastUsed: [:]).deleteAll() {
+                NSLog("[vane] Profile integration credentials could not be erased")
+            }
         }
     }
 
@@ -660,7 +868,7 @@ enum Passwords {
 }
 
 /// A save offer waiting on the user. Held only until they answer.
-struct PendingSave: Equatable, Identifiable {
+struct PendingSave: Equatable, Identifiable, Sendable {
     var attempt: String? = nil
     var revision: Passwords.Revision? = nil
     var port: Int = 443
@@ -964,9 +1172,9 @@ final class WeakHandler: NSObject, WKScriptMessageHandler {
                 + "https://saved.example,ada,first\n"
                 + "https://blocked.example,ada,second\n")
                 .write(to: importFile, atomically: true, encoding: .utf8)
-            let result = try PasswordImport.importFile(importFile) { entry in
+            let result = try PasswordImport.importFile(importFile, save: { entry in
                 entry.host != "blocked.example"
-            }
+            })
             check("password import counts only credentials actually stored",
                   result.imported == 1 && result.failed == 1 && result.skipped == 0)
         } catch {

@@ -409,6 +409,10 @@ struct TitleReveal: Equatable, Sendable {
     @Published var pendingSave: PendingSave? {
         didSet {
             passwordOfferExpiry?.cancel()
+            if oldValue?.id != nil, oldValue?.id != pendingSave?.id {
+                passwordSaveReadTask?.cancel()
+                passwordSaveReadRequest = UUID()
+            }
             guard let id = pendingSave?.id else { return }
             passwordOfferExpiry = Task { [weak self] in
                 try? await Task.sleep(for: .seconds(300))
@@ -419,6 +423,16 @@ struct TitleReveal: Equatable, Sendable {
     }
     private var passwordOfferExpiry: Task<Void, Never>?
     private var lastPasswordAttempt: String?
+    var passwordReader = Passwords.Reader()
+    private var passwordReadTask: Task<Void, Never>?
+    private var passwordReadRequest = UUID()
+    private var passwordExplicitFillRequest: UUID?
+    private var passwordSaveReadTask: Task<Void, Never>?
+    private var passwordCommitOffer: UUID?
+    private var passwordSaveReadRequest = UUID()
+    private var passwordSubmission: (request: UUID, origin: PasswordOrigin, expires: Date)?
+    private var viewSourceTask: Task<Void, Never>?
+    private var viewSourceRequest = UUID()
     @Published var passwordSaveProblem: String?
     /// The account list hanging under this page's login form, when the site has more than
     /// one saved login. Nil the rest of the time, which is most of the time.
@@ -919,9 +933,10 @@ struct TitleReveal: Equatable, Sendable {
         editableFrames.removeAll()
         titlePlaceholderURL = nil
         if stays, homeURL == nil { homeURL = url }
-        easelObservation = repository.$boards.sink { [weak self] boards in
+        easelObservation = repository.$boards.combineLatest(repository.$loading).sink { [weak self] boards, loading in
             let board = boards.first { $0.id == id }
-            self?.title = board.map { $0.title.isEmpty ? "Untitled Easel" : $0.title } ?? "Easel unavailable"
+            self?.title = board.map { $0.title.isEmpty ? "Untitled Easel" : $0.title }
+                ?? (loading ? "Loading Easel…" : "Easel unavailable")
         }
         return true
     }
@@ -984,6 +999,10 @@ struct TitleReveal: Equatable, Sendable {
         navigationState.invalidate()
         loading = false
         draftProtection.reset()
+        passwordReadTask?.cancel(); passwordSaveReadTask?.cancel()
+        passwordReadRequest = UUID(); passwordSaveReadRequest = UUID()
+        passwordSubmission = nil
+        viewSourceTask?.cancel(); viewSourceRequest = UUID()
         readingDocumentGeneration = UUID()
         Reader.forget(tab: self)
         passwordStep = nil
@@ -1293,38 +1312,58 @@ struct TitleReveal: Equatable, Sendable {
             }
             return
         }
-        var hits: [Passwords.Login]
-        do { hits = try Passwords.matchesChecked(origin: origin, profileID: profileID) }
-        catch {
-            passwordSaveProblem = error.localizedDescription
-            if announcing { Toasts.show(error.localizedDescription); axAnnounce(error.localizedDescription) }
-            return
-        }
-        if automatic, let hint = accountHint, !hint.isEmpty {
-            hits = hits.filter { $0.account == hint }
-        }
-        guard hits.count > 1 else {
-            if let one = hits.first {
-                fill(one, automatic: automatic, target: target, continuation: continuation)
-            } else if announcing {
-                axAnnounce("No saved password for \(host).")
+        readPasswordLogins(origin: origin, announcing: announcing) { [weak self] hits in
+            guard let self else { return }
+            var hits = hits
+            if automatic, let hint = accountHint, !hint.isEmpty {
+                hits = hits.filter { $0.account == hint }
             }
-            return
+            guard hits.count > 1 else {
+                if let one = hits.first {
+                    self.fill(one, automatic: automatic, target: target, continuation: continuation)
+                } else if announcing { axAnnounce("No saved password for \(host).") }
+                return
+            }
+            if automatic { return }
+            let page = self.web, pageURL = page.url, document = self.readingDocumentGeneration
+            let request = self.passwordReadRequest
+            page.evaluateJavaScript(Autofill.anchorJS(target: target),
+                                   in: nil, in: Autofill.world) { [weak self, weak page] result in
+                guard case let .success(value) = result, let raw = value as? String,
+                      let json = raw.data(using: .utf8),
+                      let rect = try? JSONSerialization.jsonObject(with: json) as? [String: Any],
+                      let self, let page, self.existingWeb === page, page.url == pageURL,
+                      self.readingDocumentGeneration == document, self.secureOrigin == origin,
+                      self.passwordReadRequest == request else { return }
+                self.openChooser(host: host, accounts: hits.map(\.account), at: rect.compactMapValues { $0 as? Double },
+                                 target: target, accountHint: accountHint)
+            }
         }
-        // Multiple saved accounts are offered on focus; loading a page alone should not
-        // open a popup over a field the user has not interacted with.
-        if automatic { return }
-        let page = web, pageURL = page.url, document = readingDocumentGeneration
-        page.evaluateJavaScript(Autofill.anchorJS(target: target),
-                               in: nil, in: Autofill.world) { [weak self] result in
-            guard case let .success(value) = result, let raw = value as? String,
-                  let json = raw.data(using: .utf8),
-                  let rect = try? JSONSerialization.jsonObject(with: json) as? [String: Any]
-            else { return }
-            guard let self, self.existingWeb === page, page.url == pageURL,
-                  self.readingDocumentGeneration == document, self.secureOrigin == origin else { return }
-            self.openChooser(host: host, accounts: hits.map(\.account), at: rect.compactMapValues { $0 as? Double },
-                             target: target, accountHint: accountHint)
+    }
+
+    private func readPasswordLogins(origin: PasswordOrigin, announcing: Bool,
+                                    completion: @escaping @MainActor ([Passwords.Login]) -> Void) {
+        guard !isPrivate, secureOrigin == origin, let page = existingWeb else { return }
+        passwordReadTask?.cancel()
+        let request = UUID(), document = readingDocumentGeneration, pageURL = page.url
+        let profile = profileID, reader = passwordReader
+        passwordReadRequest = request
+        passwordReadTask = Task { [weak self, weak page] in
+            do {
+                let hits = try await reader.logins(origin: origin, profileID: profile)
+                guard let self, let page, !Task.isCancelled, !self.tornDown, !self.suspended,
+                      !self.isPrivate, self.profileID == profile, self.existingWeb === page,
+                      page.url == pageURL, self.readingDocumentGeneration == document,
+                      self.secureOrigin == origin, self.passwordReadRequest == request else { return }
+                completion(hits)
+            } catch {
+                guard let self, let page, !Task.isCancelled, !self.tornDown,
+                      self.existingWeb === page, page.url == pageURL,
+                      self.readingDocumentGeneration == document, self.secureOrigin == origin,
+                      self.passwordReadRequest == request else { return }
+                self.passwordSaveProblem = error.localizedDescription
+                if announcing { Toasts.show(error.localizedDescription); axAnnounce(error.localizedDescription) }
+            }
         }
     }
 
@@ -1348,30 +1387,38 @@ struct TitleReveal: Equatable, Sendable {
             return
         }
         closeChooser(.filled)
-        let password: String
-        do {
-            guard let plain = try Passwords.passwordChecked(origin: login.origin, account: login.account, profileID: profileID)
-            else { throw Passwords.Failure(status: errSecItemNotFound) }
-            password = plain
-        } catch {
-            passwordSaveProblem = error.localizedDescription
-            if !automatic { Toasts.show(error.localizedDescription); axAnnounce(error.localizedDescription) }
-            return
-        }
-        let page = web, pageURL = page.url, document = readingDocumentGeneration
-        page.evaluateJavaScript(Autofill.fillJS(account: login.account, password: password,
-                                             automatic: automatic, target: target, continuation: continuation),
-                               in: nil, in: Autofill.world) { [weak self] result in
-            // The script says whether it found a form. Silence on a page with no sign-in
-            // form is indistinguishable from a fill that went somewhere invisible.
-            guard let self, self.existingWeb === page, page.url == pageURL,
-                  self.readingDocumentGeneration == document, self.secureOrigin == login.origin,
-                  case let .success(value) = result else { return }
-            if (value as? Bool) == true {
-                self.lastFilledAt = .now
-                Passwords.recordUse(origin: login.origin, account: login.account, profileID: self.profileID)
-            } else if !automatic {
-                axAnnounce("No sign-in form on this page.")
+        passwordReadTask?.cancel()
+        let request = UUID(), document = readingDocumentGeneration
+        let page = web, pageURL = page.url, profile = profileID, reader = passwordReader
+        passwordReadRequest = request
+        passwordExplicitFillRequest = automatic ? nil : request
+        passwordReadTask = Task { [weak self, weak page] in
+            do {
+                guard let password = try await reader.secret(login, profileID: profile)
+                else { throw Passwords.Failure(status: errSecItemNotFound) }
+                guard let self, let page, !Task.isCancelled, !self.tornDown, !self.suspended,
+                      !self.isPrivate, self.profileID == profile, self.existingWeb === page,
+                      page.url == pageURL, self.readingDocumentGeneration == document,
+                      self.secureOrigin == login.origin, self.passwordReadRequest == request else { return }
+                page.evaluateJavaScript(Autofill.fillJS(account: login.account, password: password,
+                                                     automatic: automatic, target: target, continuation: continuation),
+                                       in: nil, in: Autofill.world) { [weak self, weak page] result in
+                    guard let self, let page, self.existingWeb === page, page.url == pageURL,
+                          self.readingDocumentGeneration == document, self.secureOrigin == login.origin,
+                          self.passwordReadRequest == request, self.profileID == profile,
+                          case let .success(value) = result else { return }
+                    if (value as? Bool) == true {
+                        self.lastFilledAt = .now
+                        Passwords.recordUse(origin: login.origin, account: login.account, profileID: profile)
+                    } else if !automatic { axAnnounce("No sign-in form on this page.") }
+                }
+            } catch {
+                guard let self, let page, !Task.isCancelled, !self.tornDown,
+                      self.existingWeb === page, page.url == pageURL,
+                      self.readingDocumentGeneration == document, self.secureOrigin == login.origin,
+                      self.passwordReadRequest == request else { return }
+                self.passwordSaveProblem = error.localizedDescription
+                if !automatic { Toasts.show(error.localizedDescription); axAnnounce(error.localizedDescription) }
             }
         }
     }
@@ -1382,16 +1429,9 @@ struct TitleReveal: Equatable, Sendable {
     /// blur, and the blur is a dismiss. Reading the state here lost every click.
     func fillChosen(host: String, account: String, port: Int = 443, target: String? = nil) {
         guard !isPrivate else { return }
-        do {
-            guard let hit = try Passwords.matchesChecked(origin: PasswordOrigin(host: host, port: port), profileID: profileID)
-                .first(where: { $0.account == account }) else { throw Passwords.Failure(status: errSecItemNotFound) }
-            fill(hit, target: target)
-        } catch {
-            closeChooser(.filled)
-            passwordSaveProblem = error.localizedDescription
-            Toasts.show(error.localizedDescription)
-            axAnnounce(error.localizedDescription)
-        }
+        // The secret reader resolves an owned persistent reference for this exact
+        // account; another metadata enumeration would add a blur/dismiss race here.
+        fill(.init(origin: PasswordOrigin(host: host, port: port), account: account), target: target)
     }
 
     /// Whether the pointer is over the list. Set by the view; read by `closeChooser` for the
@@ -1402,6 +1442,13 @@ struct TitleReveal: Equatable, Sendable {
     /// place — `PasswordChooser.opens` — and cannot drift between the page's events, the
     /// window's, and the keyboard's.
     func closeChooser(_ event: ChooserEvent) {
+        let choosingBlur = event == .blur && passwordExplicitFillRequest == passwordReadRequest
+        if event != .filled && !choosingBlur && !PasswordChooser.opens(event,
+                sinceFill: Date.now.timeIntervalSince(lastFilledAt), pointerInside: chooserHovered) {
+            passwordReadTask?.cancel()
+            passwordReadRequest = UUID()
+        }
+
         guard passwordChoice != nil || passwordGeneration != nil,
               !PasswordChooser.opens(event,
                                      sinceFill: Date.now.timeIntervalSince(lastFilledAt),
@@ -1476,6 +1523,7 @@ struct TitleReveal: Equatable, Sendable {
     }
 
     func allowCertificateNavigation(to url: URL?) {
+        validatePasswordSubmissionNavigation(to: url)
         navigationState.cancelPrompt()
         CertificateTrust.navigationStarted(in: self)
         // WebKit may cancel the previous navigation after this policy answer and
@@ -1558,6 +1606,7 @@ struct TitleReveal: Equatable, Sendable {
         guard ownsNavigation(navigation, in: w) else { return }
         certificateNavigation = navigation
         certificateDestinationURL = w.url
+        validatePasswordSubmissionNavigation(to: w.url)
     }
 
     /// loadSimulatedRequest, not loadHTMLString: it leaves the failed url in the address bar
@@ -1640,6 +1689,7 @@ struct TitleReveal: Equatable, Sendable {
         Zoom.apply(to: self)
         DeveloperMode.apply(to: self)   // localhost → deployed site, and back
         closeChooser(.navigate)       // a redirect lands here without a fresh provisional
+        validatePasswordSubmissionNavigation(to: w.url)
         if let offer = pendingSave, offer.origin != secureOrigin { pendingSave = nil; passwordSaveProblem = nil }
         if let step = passwordStep, step.awaitingNavigation, step.origin == secureOrigin, step.expires > .now {
             passwordStep?.awaitingNavigation = false
@@ -1904,6 +1954,11 @@ struct TitleReveal: Equatable, Sendable {
               m.frameInfo.securityOrigin.host == secureHost,
               (m.frameInfo.securityOrigin.port == 0 ? 443 : m.frameInfo.securityOrigin.port) == secureOrigin?.port else { return }
         if let rejected = body["rejectedAttempt"] as? String {
+            if lastPasswordAttempt == rejected {
+                passwordSaveReadTask?.cancel()
+                passwordSaveReadRequest = UUID()
+                passwordSubmission = nil
+            }
             if pendingSave?.attempt == rejected { pendingSave = nil; passwordSaveProblem = nil }
             return
         }
@@ -1950,13 +2005,13 @@ struct TitleReveal: Equatable, Sendable {
         if body["focus"] as? Bool == true {
             guard let origin = secureOrigin else { return }
             let host = origin.host
-            let hits: [Passwords.Login]
-            do { hits = try Passwords.matchesChecked(origin: origin, profileID: profileID) }
-            catch { passwordSaveProblem = error.localizedDescription; Toasts.show(error.localizedDescription); return }
-            guard !hits.isEmpty else { return }
-            openChooser(host: host, accounts: hits.map(\.account),
-                        at: body.compactMapValues { $0 as? Double }, target: body["target"] as? String,
-                        accountHint: body["accountHint"] as? String)
+            let anchor = body.compactMapValues { $0 as? Double }
+            let target = body["target"] as? String, hint = body["accountHint"] as? String
+            readPasswordLogins(origin: origin, announcing: true) { [weak self] hits in
+                guard !hits.isEmpty else { return }
+                self?.openChooser(host: host, accounts: hits.map(\.account), at: anchor,
+                                  target: target, accountHint: hint)
+            }
             return
         }
         guard let password = body["password"] as? String, !password.isEmpty,
@@ -1972,21 +2027,53 @@ struct TitleReveal: Equatable, Sendable {
         // Already stored and unchanged — nothing to ask about. Only the account being
         // submitted is decrypted, and only to answer that one question.
         guard let origin = secureOrigin else { return }
-        let attempt = body["attempt"] as? String
+        offerSubmittedPassword(origin: origin, account: account, password: password, attempt: body["attempt"] as? String)
+    }
+
+    /// Submission authorization belongs to this account/origin, rather than the document
+    /// that a successful form normally replaces before a slow Keychain query returns.
+    func offerSubmittedPassword(origin: PasswordOrigin, account: String, password: String, attempt: String?) {
+        guard !isPrivate, !password.isEmpty, secureOrigin == origin,
+              !Passwords.isNeverSaved(host: origin.host, profileID: profileID) else { return }
+        let host = origin.host
         if let attempt, lastPasswordAttempt == attempt { return }
         lastPasswordAttempt = attempt
-        do {
-            let stored = try Passwords.passwordChecked(origin: origin, account: account, profileID: profileID)
-            if stored == password { return }
-            let revision = try Passwords.revision(origin: origin, account: account, profileID: profileID)
-            passwordSaveProblem = nil
-            pendingSave = PendingSave(attempt: attempt, revision: revision, port: origin.port,
-                                      host: host, account: account, password: password, update: stored != nil)
-        } catch {
-            // Retain the submitted draft, but never interpret failed access as absence.
-            passwordSaveProblem = error.localizedDescription
-            pendingSave = PendingSave(attempt: attempt, port: origin.port, host: host, account: account, password: password)
+        passwordSaveReadTask?.cancel()
+        let request = UUID()
+        let page = web, profile = profileID, reader = passwordReader
+        passwordSaveReadRequest = request
+        passwordSubmission = (request, origin, .now.addingTimeInterval(300))
+        passwordSaveReadTask = Task { [weak self, weak page] in
+            let outcome: Result<(String?, Passwords.Revision?), Error>
+            do { outcome = .success(try await reader.saved(origin: origin, account: account, profileID: profile)) }
+            catch { outcome = .failure(error) }
+            guard let self, let page, !Task.isCancelled, !self.tornDown, !self.suspended,
+                  !self.isPrivate, self.profileID == profile, self.existingWeb === page,
+                  self.secureOrigin == origin, self.passwordSaveReadRequest == request,
+                  self.passwordSubmission?.request == request,
+                  self.passwordSubmission.map({ $0.expires > .now }) == true,
+                  !Passwords.isNeverSaved(host: host, profileID: profile) else { return }
+            self.passwordSubmission = nil
+            switch outcome {
+            case .success(let (stored, revision)):
+                guard stored != password else { return }
+                self.passwordSaveProblem = nil
+                self.pendingSave = PendingSave(attempt: attempt, revision: revision, port: origin.port,
+                    host: host, account: account, password: password, update: stored != nil)
+            case .failure(let error):
+                self.passwordSaveProblem = error.localizedDescription
+                self.pendingSave = PendingSave(attempt: attempt, port: origin.port,
+                    host: host, account: account, password: password)
+            }
         }
+    }
+
+    private func validatePasswordSubmissionNavigation(to url: URL?) {
+        guard let submission = passwordSubmission,
+              url.flatMap(PasswordOrigin.init(url:)) != submission.origin else { return }
+        passwordSubmission = nil
+        passwordSaveReadTask?.cancel()
+        passwordSaveReadRequest = UUID()
     }
 
     func confirmSave(origin reviewedOrigin: PasswordOrigin? = nil, account reviewedAccount: String? = nil,
@@ -1996,31 +2083,56 @@ struct TitleReveal: Equatable, Sendable {
         let password = reviewedPassword ?? p.password
         guard origin.scheme == "https", !password.isEmpty else { return }
         do {
-            let existing = try Passwords.passwordChecked(origin: origin, account: account, profileID: profileID)
-            let revision = try Passwords.revision(origin: origin, account: account, profileID: profileID)
-            let sameIdentity = origin == p.origin && account == p.account
-            if existing != nil && (!p.update || !sameIdentity || (p.revision != nil && p.revision != revision)) {
-                pendingSave = PendingSave(attempt: p.attempt, revision: revision, port: origin.port, host: origin.host,
-                                          account: account, password: password, update: true)
-                passwordSaveProblem = "A saved login exists or changed since this offer. Review it before choosing Update."
-                return
-            }
-            if p.update && sameIdentity {
-                guard existing != nil else { throw Passwords.Failure(status: errSecItemNotFound) }
-                try Passwords.editChecked(.init(origin: origin, account: account), origin: origin, account: account,
-                                          password: password, profileID: profileID)
-            } else {
-                try Passwords.saveChecked(origin: origin, account: account, password: password,
-                                          profileID: profileID, replacingExisting: false)
-            }
+            applyPasswordSave(try Passwords.reviewedSave(p, origin: origin, account: account,
+                password: password, profileID: profileID), offer: p)
         } catch {
             passwordSaveProblem = error.localizedDescription
             axAnnounce(passwordSaveProblem ?? "")
-            return
         }
-        passwordSaveProblem = nil
-        axAnnounce(p.update ? "Password updated." : "Password saved.")
-        pendingSave = nil
+    }
+
+    /// The UI path; the synchronous counterpart remains for offline checks and fixtures.
+    func confirmSaveAsync(origin reviewedOrigin: PasswordOrigin? = nil, account reviewedAccount: String? = nil,
+                          password reviewedPassword: String? = nil) {
+        guard !isPrivate, let offer = pendingSave, passwordCommitOffer != offer.id else { return }
+        let origin = reviewedOrigin ?? offer.origin, account = reviewedAccount ?? offer.account
+        let password = reviewedPassword ?? offer.password
+        guard origin.scheme == "https", !password.isEmpty,
+              let operation = Passwords.beginUIOperation() else { return }
+        let profile = profileID, reader = passwordReader
+        passwordSaveReadTask?.cancel()
+        passwordSaveReadRequest = UUID()
+        passwordCommitOffer = offer.id
+        passwordSaveReadTask = Task { [weak self] in
+            defer {
+                operation.finish()
+                if self?.passwordCommitOffer == offer.id { self?.passwordCommitOffer = nil }
+            }
+            do {
+                let decision = try await reader.save(offer, origin: origin, account: account,
+                    password: password, profileID: profile)
+                guard let self, !Task.isCancelled, !self.tornDown, !self.isPrivate,
+                      self.profileID == profile, self.pendingSave?.id == offer.id else { return }
+                self.applyPasswordSave(decision, offer: offer)
+            } catch {
+                guard let self, !Task.isCancelled, !self.tornDown,
+                      self.profileID == profile, self.pendingSave?.id == offer.id else { return }
+                self.passwordSaveProblem = error.localizedDescription
+                axAnnounce(error.localizedDescription)
+            }
+        }
+    }
+
+    private func applyPasswordSave(_ decision: Passwords.SaveDecision, offer: PendingSave) {
+        switch decision {
+        case .review(let updated):
+            pendingSave = updated
+            passwordSaveProblem = "A saved login exists or changed since this offer. Review it before choosing Update."
+        case .saved:
+            passwordSaveProblem = nil
+            axAnnounce(offer.update ? "Password updated." : "Password saved.")
+            pendingSave = nil
+        }
     }
 
     /// "Never for this site". Saying no once is a decision about this password; saying never
@@ -2064,19 +2176,41 @@ struct TitleReveal: Equatable, Sendable {
     /// ⌥⌘U. ponytail: WebKit has no view-source: handler, so this is the page's own HTML
     /// in a <pre>. No syntax highlighting — that is what the inspector is for.
     func viewSource(into store: TabStore) {
-        web.evaluateJavaScript("document.documentElement.outerHTML") { html, _ in
-            guard let html = html as? String else { return }
-            let escaped = html.replacingOccurrences(of: "&", with: "&amp;")
-                              .replacingOccurrences(of: "<", with: "&lt;")
-                              .replacingOccurrences(of: ">", with: "&gt;")
-            let tab = store.newBlankTab()
-            tab.title = "Source of " + (self.web.url?.host ?? "page")
-            tab.web.loadHTMLString(
-                "<meta charset=utf-8><body style='margin:0'>"
-                + "<pre style='font:12px ui-monospace,Menlo,monospace;padding:16px;"
-                + "white-space:pre-wrap;word-break:break-word'>\(escaped)</pre>", baseURL: nil)
+        viewSourceTask?.cancel()
+        let request = UUID()
+        viewSourceRequest = request
+        let page = web, pageURL = page.url, document = readingDocumentGeneration
+        let host = pageURL?.host ?? "page", profile = profileID
+        page.evaluateJavaScript(ViewSourcePage.script) { [weak self, weak store, weak page] html, error in
+            guard let self, let store, let page, error == nil, !self.tornDown,
+                  self.existingWeb === page, page.url == pageURL,
+                  self.readingDocumentGeneration == document, self.viewSourceRequest == request,
+                  store.profileID == profile else { return }
+            guard let html = html as? String else {
+                Toasts.show(ViewSourcePage.TooLarge().localizedDescription, in: store)
+                return
+            }
+            self.viewSourceTask = Task { [weak self, weak store, weak page] in
+                do {
+                    let source = try await NativePageWork.run { try ViewSourcePage.build(html) }
+                    guard let self, let store, let page, !self.tornDown, !self.suspended,
+                          self.existingWeb === page, page.url == pageURL,
+                          self.readingDocumentGeneration == document, self.viewSourceRequest == request,
+                  store.profileID == profile else { return }
+                    let tab = store.newBlankTab()
+                    tab.title = "Source of " + host
+                    tab.web.loadHTMLString(source, baseURL: nil)
+                } catch {
+                    guard let self, let store, let page, !self.tornDown,
+                          self.existingWeb === page, page.url == pageURL,
+                          self.readingDocumentGeneration == document, self.viewSourceRequest == request,
+                          !Task.isCancelled else { return }
+                    Toasts.show(error.localizedDescription, in: store)
+                }
+            }
         }
     }
+
     func back()    { expectNavigation(existingWeb?.goBack()) }
     func forward() { expectNavigation(existingWeb?.goForward()) }
 
@@ -2091,7 +2225,8 @@ struct TitleReveal: Equatable, Sendable {
     /// `window.close()` that did nothing.
     func webView(_ w: WKWebView, createWebViewWith cfg: WKWebViewConfiguration,
                  for action: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        guard w === existingWeb, !tornDown, !suspended else { return nil }
+        guard w === existingWeb, !tornDown, !suspended,
+              !AppLifecycle.shared.persistenceExitInProgress else { return nil }
         // `window.open('zoommtg:…')`. Belt and braces around the same test in
         // `decidePolicyFor` — a popup opened with no url and navigated afterwards arrives
         // here first — and a new tab for a scheme no tab can load is worse than no tab.
@@ -2621,6 +2756,7 @@ struct Stash {
     /// tab only comes into being when the user searches or opens something from it — a
     /// dismissed bar leaves nothing behind.
     func newTab(_ url: URL?) {
+        guard !AppLifecycle.shared.persistenceExitInProgress else { return }
         // One page per Little Arc: ⌘T, the palette's New Tab and everything else that asks
         // this window for a tab gets another Little Arc instead of a second page hidden
         // behind the first. With no url it comes up empty with the search bar over it,
@@ -3293,7 +3429,7 @@ struct Stash {
     /// is the last reader — it migrates that key into the profile's first Space and deletes
     /// it. ponytail: the key name stays here rather than moving, so there is one place that
     /// says what a profile's defaults are called.
-    static func defaultsKey(_ kind: TabKind, _ profileID: UUID) -> String {
+    nonisolated static func defaultsKey(_ kind: TabKind, _ profileID: UUID) -> String {
         ProfileManager.defaultsKey(kind == .favourite ? "pinnedTabs" : "pinnedRows", profileID)
     }
 
@@ -3701,7 +3837,7 @@ struct Stash {
                                                 snapshot: t.snapshot) else { continue }
             parked[e.key] = e.parked
         }
-        let savedState = Suspension.SpaceState.save(parked, space: id, profileID: profileID, in: Store.directory)
+        let savedState = Suspension.SpaceState.enqueueSave(parked, space: id, profileID: profileID, in: Store.directory)
         // And which tab the Space is being left on, so switching back lands on it rather
         // than on whatever is first. Written here rather than in `switchTo` so the swipe
         // commit, the Spaces menu, ⌥⌘←/→ and ⌃1–9 all get it — every one of them saves
@@ -3762,6 +3898,76 @@ struct Stash {
         guard Suspension.SpaceState.save(parked, space: id, profileID: profileID,
                                          in: Store.directory),
               ProfileManager.shared.updateSpace(space) else { return false }
+        TabStore.saveShape(stash.pins, from: stash.tabs, kind: .pinned,
+                           space: id, profileID: profileID, ownsSection: true)
+        TabStore.saveShape(stash.todayShape, from: stash.tabs, kind: .today,
+                           space: id, profileID: profileID, ownsSection: true)
+        let selected = stash.tabs.first { $0.id == stash.current }?.pinnedURL
+        Spaces.rememberTab(selected.flatMap {
+            TabAddress.restorable($0) ? $0.absoluteString : nil
+        }, in: id)
+        return true
+    }
+
+    func saveStashedSpaceAsync(_ id: UUID) async -> Bool {
+        guard let stash = stashes[id] else { return true }
+        guard stash.fingerprint == fingerprint(of: id) else { return true }
+        guard let original = ProfileManager.shared.spaces(for: profileID).first(where: { $0.id == id }) else { return false }
+        // A stash holds live Tab objects. Capture values, not their references, so a
+        // hidden navigation/reload or changed opaque state during IO cannot be released
+        // after transferring the older address and document snapshot.
+        struct PageCapture: Equatable {
+            let id: UUID
+            let kind: TabKind
+            let page: URL?
+            let home: URL?
+            let saved: URL?
+            let document: UUID
+            let snapshot: Parked
+        }
+        @MainActor func capture(_ tabs: [Tab]) -> [PageCapture] {
+            tabs.map { PageCapture(id: $0.id, kind: $0.kind, page: $0.currentURL,
+                home: $0.homeURL, saved: $0.pinnedURL, document: $0.readingDocumentGeneration,
+                snapshot: $0.snapshot) }
+        }
+        let capturedPages = capture(stash.tabs)
+        var space = original
+        func urls(_ kind: TabKind) -> [URL] {
+            capturedPages.filter { $0.kind == kind }.compactMap(\.saved)
+                .filter { TabAddress.restorable($0) }
+        }
+        space.tabURLs = urls(.today)
+        space.pinnedTabURLs = urls(.pinned)
+        if space.layout != nil {
+            space.layout = Self.workspaceLayout(tabs: stash.tabs, pins: stash.pins, today: stash.todayShape,
+                splits: stash.splits, selected: stash.current, profile: profileID)
+        }
+        var parked: [String: Parked] = [:]
+        for tab in capturedPages {
+            guard let entry = TabStore.sidecarEntry(page: tab.page, home: tab.home,
+                                                    snapshot: tab.snapshot) else { continue }
+            parked[entry.key] = entry.parked
+        }
+        let staged = await Suspension.SpaceState.stageSave(parked, space: id, profileID: profileID, in: Store.directory)
+        guard staged.succeeded,
+              let current = stashes[id], current.fingerprint == stash.fingerprint,
+              capture(current.tabs) == capturedPages, current.pins == stash.pins,
+              current.todayShape == stash.todayShape, current.splits == stash.splits, current.current == stash.current,
+              fingerprint(of: id) == stash.fingerprint,
+              var latest = ProfileManager.shared.spaces(for: profileID).first(where: { $0.id == id }),
+              latest.layout == original.layout else {
+            if let change = staged.change { _ = await Suspension.SpaceState.repair(change) }
+            return false
+        }
+        // Tabs and layout belong to this captured stash. Rebase only those fields onto
+        // the latest Space so a rename or appearance edit made during IO survives.
+        latest.tabURLs = space.tabURLs
+        latest.pinnedTabURLs = space.pinnedTabURLs
+        latest.layout = space.layout
+        guard ProfileManager.shared.updateSpace(latest) else {
+            if let change = staged.change { _ = await Suspension.SpaceState.repair(change) }
+            return false
+        }
         TabStore.saveShape(stash.pins, from: stash.tabs, kind: .pinned,
                            space: id, profileID: profileID, ownsSection: true)
         TabStore.saveShape(stash.todayShape, from: stash.tabs, kind: .today,

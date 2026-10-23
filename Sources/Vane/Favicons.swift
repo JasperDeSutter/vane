@@ -1,5 +1,39 @@
 import AppKit
+import ImageIO
 import WebKit
+
+/// A bounded per-profile LRU. Every stored image is decoded to at most 64×64 pixels,
+/// so 300 hosts retain at most about 5 MiB of bitmap storage rather than site-sized art.
+@MainActor struct FaviconMemoryCache {
+    private let capacity: Int
+    private var images: [String: NSImage] = [:]
+    private var recent: [String] = []
+
+    init(capacity: Int = 300) { self.capacity = max(0, capacity) }
+
+    mutating func image(for key: String) -> NSImage? {
+        guard let image = images[key] else { return nil }
+        recent.removeAll { $0 == key }
+        recent.append(key)
+        return image
+    }
+
+    mutating func store(_ image: NSImage, for key: String) {
+        guard capacity > 0 else { return }
+        images[key] = image
+        recent.removeAll { $0 == key }
+        recent.append(key)
+        while recent.count > capacity { images.removeValue(forKey: recent.removeFirst()) }
+    }
+
+    subscript(key: String) -> NSImage? {
+        mutating get { image(for: key) }
+        set {
+            if let newValue { store(newValue, for: key) }
+            else { images[key] = nil; recent.removeAll { $0 == key } }
+        }
+    }
+}
 
 /// Favicons, fetched from the site itself and cached by host.
 ///
@@ -30,13 +64,20 @@ import WebKit
 
     let profileID: UUID
 
-    init(profileID: UUID = ProfileManager.defaultID) { self.profileID = profileID }
+    private let fetchImageData: @Sendable (URL) async -> Data?
+
+    init(profileID: UUID = ProfileManager.defaultID,
+         fetch: @escaping @Sendable (URL) async -> Data? = { await Favicons.fetch($0) }) {
+        self.profileID = profileID
+        self.fetchImageData = fetch
+    }
 
     /// Bumped when a fetch lands, so views that asked for a nil icon redraw.
     @Published private(set) var generation = 0
 
-    private var memory: [String: NSImage] = [:]
+    private var memory = FaviconMemoryCache()
     private var inflight: [String: Task<Void, Never>] = [:]
+    private var diskInflight: [String: Task<Void, Never>] = [:]
     /// Inspect loaded pages even after a root fallback has been cached. The same set of
     /// declarations needs one fetch per session, not another fetch on every reload.
     private var discoveries: [String: [URL]] = [:]
@@ -69,10 +110,13 @@ import WebKit
     private func recordMiss(_ key: String, attemptedFallback: Bool, at date: Date = .now) {
         guard attemptedFallback else { return }
         misses[key] = date
+        if misses.count > Self.maxFiles,
+           let oldest = misses.min(by: { $0.value < $1.value })?.key { misses[oldest] = nil }
     }
 
-    private static let maxBytes = 512_000     // an icon that big is a mistake, not an icon
+    nonisolated static let maxBytes = 512_000     // an icon that big is a mistake, not an icon
     private static let maxFiles = 300
+    nonisolated static let maxPixelDimension = 64
 
     // MARK: Public
 
@@ -81,8 +125,8 @@ import WebKit
     func icon(for url: URL) -> NSImage? {
         guard let key = Favicons.key(for: url) else { return nil }
         if let img = memory[key] { return img }
-        if let img = readDisk(key) { memory[key] = img; return img }
-        guard !missed(key), let fallback = Favicons.fallback(for: url) else { return nil }
+        if let img = readDisk(key, fallback: Favicons.fallback(for: url)) { memory[key] = img; return img }
+        guard diskInflight[key] == nil, !missed(key), let fallback = Favicons.fallback(for: url) else { return nil }
         warm(key: key, urls: [fallback], persist: profileID != Profile.incognito.id, fallback: fallback)
         return nil
     }
@@ -120,8 +164,14 @@ import WebKit
             // A failed root probe says nothing about the icons declared by this page.
             let declared = Favicons.declared(try? await web.evaluateJavaScript(Favicons.linkJS))
             guard tab.existingWeb === web, tab.currentURL == url else { return }
-            if !declared.isEmpty, self.discoveries[key] == declared { return }
-            if !declared.isEmpty { self.discoveries[key] = declared }
+            if !declared.isEmpty, self.discoveries[key] == declared, self.memory[key] != nil { return }
+            if !declared.isEmpty {
+                self.discoveries[key] = declared
+                if self.discoveries.count > Self.maxFiles,
+                   let other = self.discoveries.keys.first(where: { $0 != key }) {
+                    self.discoveries[other] = nil
+                }
+            }
             var candidates = declared
             let fallback = self.memory[key] != nil || self.missed(key) ? nil : Favicons.fallback(for: url)
             if let fallback { candidates.append(fallback) }
@@ -158,9 +208,9 @@ import WebKit
             // response. Keep its declarations in the same queue instead of losing them.
             while let url = self.pending[key]?.urls.first {
                 self.pending[key]?.urls.removeFirst()
-                let data = await Favicons.fetch(url)
+                let data = await self.fetchImageData(url)
                 if self.pending[key]?.fallbackURLs.contains(url) == true { attemptedFallback = true }
-                guard let data, let img = Favicons.image(from: data)
+                guard let data, let img = await Favicons.decoded(data)
                 else { continue }
                 self.memory[key] = img
                 received = url
@@ -182,7 +232,7 @@ import WebKit
         return task
     }
 
-    private static func fetch(_ url: URL) async -> Data? {
+    nonisolated static func fetch(_ url: URL, session: URLSession = .shared) async -> Data? {
         var req = URLRequest(url: url)
         req.timeoutInterval = 8
         // An icon is small and already compressed, so asking for it uncompressed costs
@@ -192,11 +242,23 @@ import WebKit
         // and the html decoded to no image, so the host was filed as a miss.
         req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         req.setValue("image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true,
-              (1...maxBytes).contains(data.count)
-        else { return nil }
-        return data
+        do {
+            let (bytes, response) = try await session.bytes(for: req)
+            // Stop the underlying transfer on every early return, including unknown-length
+            // and chunked responses. The old data(for:) buffered everything before checking.
+            defer { bytes.task.cancel() }
+            guard (response as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true,
+                  response.expectedContentLength <= Int64(maxBytes) else { return nil }
+            var data = Data()
+            if response.expectedContentLength > 0 {
+                data.reserveCapacity(Int(response.expectedContentLength))
+            }
+            for try await byte in bytes {
+                guard data.count < maxBytes, !Task.isCancelled else { return nil }
+                data.append(byte)
+            }
+            return data.isEmpty ? nil : data
+        } catch { return nil }
     }
 
     /// The page's own declarations, including touch icons preloaded as images (ManageBac).
@@ -204,7 +266,7 @@ import WebKit
     static let linkJS = """
     (function(){var o=[];document.querySelectorAll(\
     "link[rel~='icon' i],link[rel~='apple-touch-icon' i],link[rel~='apple-touch-icon-precomposed' i],link[rel~='preload' i][as='image' i]")\
-    .forEach(function(l){if(!l.href)return;\
+    .forEach(function(l){if(o.length>=32||!l.href)return;\
     if(l.rel.toLowerCase().split(/\\s+/).includes('preload')&&!/apple-touch-icon/i.test(l.href))return;\
     o.push({href:l.href,rel:l.rel,sizes:l.getAttribute('sizes')||'',type:l.type||''})});return o})()
     """
@@ -240,8 +302,16 @@ import WebKit
     }
 
     static func declared(_ value: Any?) -> [URL] {
-        let declarations = (value as? [[String: String]] ?? []).prefix(32).compactMap { entry -> Declaration? in
-            guard let href = entry["href"], let url = URL(string: href),
+        guard let entries = value as? NSArray else { return [] }
+        let declarations = entries.prefix(32).compactMap { raw -> Declaration? in
+            guard let native = raw as? NSDictionary, native.count <= 4 else { return nil }
+            var entry: [String: String] = [:]
+            for key in ["href", "rel", "sizes", "type"] {
+                guard let value = native[key] else { continue }
+                guard let text = value as? NSString, text.length <= 8192 else { return nil }
+                entry[key] = String(text)
+            }
+            guard let href = entry["href"], href.utf8.count <= 8192, let url = URL(string: href),
                   ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { return nil }
             return Declaration(url: url, rel: entry["rel"] ?? "icon", sizes: entry["sizes"] ?? "", type: entry["type"] ?? "")
         }
@@ -319,12 +389,54 @@ import WebKit
     /// Colored artwork, light details, and opaque tiles keep their original pixels.
     /// Applied on decode so old disk entries benefit without changing the cached bytes.
     nonisolated static func image(from data: Data) -> NSImage? {
-        guard let image = NSImage(data: data), image.isValid,
-              image.size.width > 0, image.size.height > 0 else { return nil }
+        guard !data.isEmpty, data.count <= maxBytes else { return nil }
+        guard let bitmap = thumbnail(from: data) ?? vectorBitmap(from: data),
+              bitmap.width > 0, bitmap.height > 0,
+              bitmap.width <= maxPixelDimension, bitmap.height <= maxPixelDimension else { return nil }
+        return displayImage(bitmap)
+    }
+
+    private nonisolated static func thumbnail(from data: Data) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData,
+            [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
+        guard let bitmap = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelDimension,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true
+        ] as CFDictionary), bitmap.width > 0, bitmap.height > 0,
+              bitmap.width <= maxPixelDimension, bitmap.height <= maxPixelDimension else { return nil }
+        return bitmap
+    }
+
+    private nonisolated static func displayImage(_ bitmap: CGImage) -> NSImage {
+        let image = NSImage(cgImage: bitmap, size: NSSize(width: 16, height: 16))
         image.isTemplate = isDarkMark(image)
         // Pin the point size regardless of the site's bitmap resolution.
         image.size = NSSize(width: 16, height: 16)
         return image
+    }
+
+    /// ImageIO does not decode SVG. AppKit's SVG representation is a vector; draw it
+    /// into our own small bitmap rather than asking it to create an intrinsic-size image.
+    /// Production callers use a worker for this path, including pre-existing disk entries.
+    private nonisolated static func vectorBitmap(from data: Data) -> CGImage? {
+        guard let vector = NSImage(data: data),
+              vector.size.width.isFinite, vector.size.height.isFinite,
+              vector.size.width > 0, vector.size.height > 0,
+              vector.size.width <= 16_384, vector.size.height <= 16_384,
+              !vector.representations.isEmpty,
+              vector.representations.allSatisfy({ $0.pixelsWide == 0 && $0.pixelsHigh == 0 }),
+              let context = CGContext(data: nil, width: maxPixelDimension, height: maxPixelDimension,
+                bitsPerComponent: 8, bytesPerRow: maxPixelDimension * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        vector.draw(in: NSRect(x: 0, y: 0, width: maxPixelDimension, height: maxPixelDimension),
+                    from: .zero, operation: .copy, fraction: 1)
+        return context.makeImage()
     }
 
     private nonisolated static func isDarkMark(_ image: NSImage) -> Bool {
@@ -373,25 +485,54 @@ import WebKit
         return d
     }
 
-    private func readDisk(_ key: String) -> NSImage? {
-        guard profileID != Profile.incognito.id else { return nil }
-        return Favicons.read(dir.appendingPathComponent(key)).image
+    private func readDisk(_ key: String, fallback: URL?) -> NSImage? {
+        guard profileID != Profile.incognito.id,
+              let data = Self.readData(dir.appendingPathComponent(key)) else { return nil }
+        if let bitmap = Self.thumbnail(from: data) { return Self.displayImage(bitmap) }
+        // Legacy SVG cache files must also rasterize off the UI actor. Keep this
+        // separate from the network queue so a newly declared icon can still upgrade it.
+        guard diskInflight[key] == nil else { return nil }
+        diskInflight[key] = Task { @MainActor [weak self] in
+            let image = await Self.decoded(data)
+            guard let self else { return }
+            self.diskInflight[key] = nil
+            guard self.memory[key] == nil else { return }
+            if let image {
+                self.memory[key] = image
+                for tab in self.tabs.allObjects where tab.currentURL.flatMap(Favicons.key) == key {
+                    tab.favicon = image
+                }
+                self.generation += 1
+            } else if let fallback, !self.missed(key) {
+                self.warm(key: key, urls: [fallback], persist: true, fallback: fallback)
+            }
+        }
+        return nil
     }
 
     /// Freshly made here and handed over untouched, which is the whole of what the box
     /// asserts: nothing else has a reference to it on either side.
     private struct Icon: @unchecked Sendable { let image: NSImage? }
 
+    private nonisolated static func readData(_ file: URL) -> Data? {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: maxBytes + 1), data.count <= maxBytes else { return nil }
+        return data
+    }
+
     private nonisolated static func read(_ file: URL) -> Icon {
-        guard let data = try? Data(contentsOf: file),
-              let img = image(from: data) else { return Icon(image: nil) }
-        return Icon(image: img)
+        Icon(image: readData(file).flatMap(image(from:)))
     }
 
     /// The same read, off the main actor. The caller publishes the result — nothing here
     /// touches the cache, because the cache belongs to the actor this has just left.
     private nonisolated static func decoded(_ file: URL) async -> NSImage? {
         await Task.detached(priority: .userInitiated) { read(file) }.value.image
+    }
+
+    private nonisolated static func decoded(_ data: Data) async -> NSImage? {
+        await Task.detached(priority: .userInitiated) { Icon(image: image(from: data)) }.value.image
     }
 
     private func writeDisk(_ key: String, _ data: Data) {

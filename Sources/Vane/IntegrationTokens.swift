@@ -3,8 +3,10 @@ import Security
 
 /// Native integration grants never share the Internet-password namespace used by web
 /// autofill. One generic-password item holds each profile's GitHub login and token envelope.
-struct IntegrationTokens {
-    struct Keychain {
+struct IntegrationTokens: Sendable {
+    /// Security's C callbacks are invoked only inside Passwords' serialized service
+    /// lane. The immutable wrapper may cross executors; injected stores obey that lane.
+    struct Keychain: @unchecked Sendable {
         var copy: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
         var add: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
         var update: (CFDictionary, CFDictionary) -> OSStatus
@@ -12,6 +14,11 @@ struct IntegrationTokens {
         static var system: Self {
             Self(copy: SecItemCopyMatching, add: SecItemAdd, update: SecItemUpdate, delete: SecItemDelete)
         }
+    }
+
+    struct Access: Sendable {
+        var read: @Sendable (UUID) -> Passwords.CredentialRead = { IntegrationTokens(profileID: $0).read() }
+        var delete: @Sendable (String, UUID) -> Bool = { IntegrationTokens(profileID: $1).delete(account: $0) }
     }
 
     static let legacyOrigin = PasswordOrigin(host: "api.github.com")
@@ -51,6 +58,7 @@ struct IntegrationTokens {
         query[kSecReturnPersistentRef as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitAll
         var output: CFTypeRef?
+        try Passwords.checkServiceCancellation()
         let status = keychain.copy(query as CFDictionary, &output)
         if status == errSecItemNotFound { return [] }
         guard status == errSecSuccess else { throw Passwords.Failure(status: status) }
@@ -71,6 +79,7 @@ struct IntegrationTokens {
 
     private func secret(_ item: [String: Any], itemClass: CFString) throws -> Data {
         var output: CFTypeRef?
+        try Passwords.checkServiceCancellation()
         let status = keychain.copy([
             kSecClass as String: itemClass, kSecValuePersistentRef as String: try reference(item),
             kSecReturnData as String: true,
@@ -100,6 +109,7 @@ struct IntegrationTokens {
     }
 
     private func remove(_ item: [String: Any], itemClass: CFString) throws {
+        try Passwords.checkServiceCancellation()
         let status = keychain.delete([kSecClass as String: itemClass,
             kSecValuePersistentRef as String: try reference(item)] as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw Passwords.Failure(status: status) }
@@ -118,66 +128,72 @@ struct IntegrationTokens {
     }
 
     func read() -> Passwords.CredentialRead {
-        do {
-            if let item = try nativeItem() {
-                let value = try credential(item)
-                cleanupLegacyAfterSave()
-                return .found(account: value.account, password: value.password)
-            }
-            let items = try legacyItems()
-            let logins = try items.map { item -> Passwords.Login in
-                guard let account = item[kSecAttrAccount as String] as? String, !account.isEmpty else {
+        return Passwords.serialized {
+            do {
+                if let item = try nativeItem() {
+                    let value = try credential(item)
+                    cleanupLegacyAfterSave()
+                    return .found(account: value.account, password: value.password)
+                }
+                let items = try legacyItems()
+                let logins = try items.map { item -> Passwords.Login in
+                    guard let account = item[kSecAttrAccount as String] as? String, !account.isEmpty else {
+                        throw Passwords.Failure(status: errSecDecode)
+                    }
+                    return Passwords.Login(origin: Self.legacyOrigin, account: account)
+                }
+                guard let account = Passwords.rank(logins, used: lastUsed).first?.account,
+                      let item = items.first(where: { $0[kSecAttrAccount as String] as? String == account }) else { return .missing }
+                let data = try secret(item, itemClass: kSecClassInternetPassword)
+                guard let password = String(data: data, encoding: .utf8), !password.isEmpty else {
                     throw Passwords.Failure(status: errSecDecode)
                 }
-                return Passwords.Login(origin: Self.legacyOrigin, account: account)
-            }
-            guard let account = Passwords.rank(logins, used: lastUsed).first?.account,
-                  let item = items.first(where: { $0[kSecAttrAccount as String] as? String == account }) else { return .missing }
-            let data = try secret(item, itemClass: kSecClassInternetPassword)
-            guard let password = String(data: data, encoding: .utf8), !password.isEmpty else {
-                throw Passwords.Failure(status: errSecDecode)
-            }
-            // Migration is add-only: another process may already have persisted a newer
-            // grant. Never overwrite it with the old Internet password.
-            let status = try add(Credential(account: account, password: password))
-            if status == errSecDuplicateItem {
-                guard let winner = try nativeItem() else { throw Passwords.Failure(status: status) }
-                let value = try credential(winner)
+                // Migration is add-only: another process may already have persisted a newer
+                // grant. Never overwrite it with the old Internet password.
+                let status = try add(Credential(account: account, password: password))
+                if status == errSecDuplicateItem {
+                    guard let winner = try nativeItem() else { throw Passwords.Failure(status: status) }
+                    let value = try credential(winner)
+                    cleanupLegacyAfterSave()
+                    return .found(account: value.account, password: value.password)
+                }
+                guard status == errSecSuccess else { throw Passwords.Failure(status: status) }
                 cleanupLegacyAfterSave()
-                return .found(account: value.account, password: value.password)
-            }
-            guard status == errSecSuccess else { throw Passwords.Failure(status: status) }
-            cleanupLegacyAfterSave()
-            return .found(account: account, password: password)
-        } catch let error as Passwords.Failure { return .unavailable(error.status) }
-        catch { return .unavailable(errSecDecode) }
+                return .found(account: account, password: password)
+            } catch let error as Passwords.Failure { return .unavailable(error.status) }
+            catch { return .unavailable(errSecDecode) }
+        }
     }
 
     private func add(_ credential: Credential) throws -> OSStatus {
         var add = query
         add[kSecValueData as String] = try JSONEncoder().encode(credential)
         add[kSecAttrLabel as String] = "GitHub integration (Vane)"
+        try Passwords.checkServiceCancellation()
         return keychain.add(add as CFDictionary, nil)
     }
 
     /// SecItem success establishes durable storage before any legacy item is removed.
     func save(account: String, password: String) -> Bool {
-        guard !account.isEmpty, !password.isEmpty else { return false }
-        do {
-            let value = Credential(account: account, password: password)
-            if let item = try nativeItem() {
-                try update(item, value: value)
-            } else {
-                let status = try add(value)
-                if status == errSecDuplicateItem, let item = try nativeItem() { try update(item, value: value) }
-                else if status != errSecSuccess { throw Passwords.Failure(status: status) }
-            }
-            cleanupLegacyAfterSave()
-            return true
-        } catch { return false }
+        return Passwords.serialized {
+            guard !account.isEmpty, !password.isEmpty else { return false }
+            do {
+                let value = Credential(account: account, password: password)
+                if let item = try nativeItem() {
+                    try update(item, value: value)
+                } else {
+                    let status = try add(value)
+                    if status == errSecDuplicateItem, let item = try nativeItem() { try update(item, value: value) }
+                    else if status != errSecSuccess { throw Passwords.Failure(status: status) }
+                }
+                cleanupLegacyAfterSave()
+                return true
+            } catch { return false }
+        }
     }
 
     private func update(_ item: [String: Any], value: Credential) throws {
+        try Passwords.checkServiceCancellation()
         let status = keychain.update([kSecClass as String: kSecClassGenericPassword,
             kSecValuePersistentRef as String: try reference(item)] as CFDictionary,
             [kSecValueData as String: try JSONEncoder().encode(value)] as CFDictionary)
@@ -185,30 +201,36 @@ struct IntegrationTokens {
     }
 
     func delete(account: String) -> Bool {
-        do {
-            if let item = try nativeItem(), try credential(item).account != account { return false }
-            return deleteAll()
-        } catch { return false }
+        return Passwords.serialized {
+            do {
+                if let item = try nativeItem(), try credential(item).account != account { return false }
+                return deleteAll()
+            } catch { return false }
+        }
     }
 
     /// Remove legacy values first: a locked/failed cleanup must leave the authoritative
     /// native value intact, so a later read cannot resurrect an older integration token.
     func deleteAll() -> Bool {
-        do {
-            try removeLegacy()
-            if let item = try nativeItem() { try remove(item, itemClass: kSecClassGenericPassword) }
-            return true
-        } catch { return false }
+        return Passwords.serialized {
+            do {
+                try removeLegacy()
+                if let item = try nativeItem() { try remove(item, itemClass: kSecClassGenericPassword) }
+                return true
+            } catch { return false }
+        }
     }
 
     /// The service binds this enumeration to one data directory, across all its profiles.
     static func deleteEverything(dataDir: String? = Store.overrideDirectory, keychain: Keychain = .system) -> Bool {
-        let store = Self(profileID: ProfileManager.defaultID, dataDir: dataDir, keychain: keychain, lastUsed: [:])
-        var query = store.query
-        query.removeValue(forKey: kSecAttrAccount as String)
-        do {
-            for item in try store.attributes(query) { try store.remove(item, itemClass: kSecClassGenericPassword) }
-            return true
-        } catch { return false }
+        return Passwords.serialized {
+            let store = Self(profileID: ProfileManager.defaultID, dataDir: dataDir, keychain: keychain, lastUsed: [:])
+            var query = store.query
+            query.removeValue(forKey: kSecAttrAccount as String)
+            do {
+                for item in try store.attributes(query) { try store.remove(item, itemClass: kSecClassGenericPassword) }
+                return true
+            } catch { return false }
+        }
     }
 }

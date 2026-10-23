@@ -58,17 +58,9 @@ import WebKit
         }
         await WKWebsiteDataStore.default().removeData(ofTypes: types, modifiedSince: .distantPast)
 
-        // The keychain is not partitioned by data dir, so only the real installation may
-        // take every credential Vane has filed (the GitHub token among them). A data-dir
-        // instance takes its own profiles' — the ones filed under a security domain — and
-        // leaves the default profile's alone, because those are the real app's.
-        if Store.overrideDirectory == nil {
-            Passwords.deleteEverything()
-        } else {
-            for id in ProfileManager.shared.profiles.map(\.id) where id != ProfileManager.defaultID {
-                Passwords.deleteAll(profileID: id)
-            }
-        }
+        // Scoped erasure removes this instance's web passwords and dedicated native
+        // integration tokens, including its default profile, without touching neighbours.
+        try? await Passwords.perform { Passwords.deleteEverything() }
 
         try? FileManager.default.removeItem(at: Store.directory)
         // The pre-sandbox folder is Vane's data too. If the sandbox lets it go, it goes;

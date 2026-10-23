@@ -1,4 +1,5 @@
 import Darwin
+import CryptoKit
 import Foundation
 
 /// One Keychain value holds the rotating pair, so a relaunch cannot combine tokens from
@@ -33,6 +34,14 @@ struct GitHubSignedIn: Sendable {
     let login: String
     let credential: GitHubCredential
     var token: String { credential.accessToken }
+    var fingerprint: Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        var value = Data(login.utf8)
+        value.append(0)
+        value.append(try! encoder.encode(credential))
+        return Data(SHA256.hash(data: value))
+    }
 }
 
 /// The file contains no secrets. flock covers separate processes, while the coordinator's
@@ -69,25 +78,36 @@ final class GitHubRefreshLock {
     let lockURL: URL
     private let read: () -> Passwords.CredentialRead
     private let write: (String, String) -> Bool
+    typealias Commit = (GitHubSignedIn, GitHubSignedIn) async -> Bool
+    private let commit: Commit?
+    private let readAsync: (() async -> Passwords.CredentialRead)?
     private let secret: () -> String?
     private let send: Send
     private var inFlight: Task<Result<GitHubSignedIn, GitHub.Trouble>, Never>?
     /// Rotation consumes the previous refresh token. If Keychain is temporarily unwritable,
     /// retain the new pair in memory and retry saving it rather than spending the old pair.
     private var pending: (previous: GitHubSignedIn, next: GitHubSignedIn)?
+    /// Fingerprints retain proof of the last completed rotation without retaining its
+    /// spent token. A sign-out waiting for our refresh lock may delete that successor.
+    private var lastCommittedRotation: (previous: Data, next: Data)?
 
     init(lockURL: URL, read: @escaping () -> Passwords.CredentialRead,
          write: @escaping (String, String) -> Bool, secret: @escaping () -> String?,
-         send: Send? = nil) {
+         send: Send? = nil, readAsync: (() async -> Passwords.CredentialRead)? = nil,
+         commit: Commit? = nil) {
         self.lockURL = lockURL
         self.read = read
         self.write = write
+        self.commit = commit
+        self.readAsync = readAsync
         self.secret = secret
         self.send = send ?? Self.request
     }
 
     func token(after token: String, force: Bool = false) async -> Result<GitHubSignedIn, GitHub.Trouble> {
         if let inFlight { return await inFlight.value }
+        guard let operation = Passwords.beginUIOperation() else { return .failure(.offline) }
+        defer { operation.finish() }
         let task = Task { await rotate(after: token, force: force) }
         inFlight = task
         let result = await task.value
@@ -99,8 +119,9 @@ final class GitHubRefreshLock {
         case found(GitHubSignedIn), missing, unavailable
     }
 
-    private func saved() -> Saved {
-        switch read() {
+    private func saved() async -> Saved {
+        let current = if let readAsync { await readAsync() } else { read() }
+        switch current {
         case .missing: return .missing
         case .unavailable: return .unavailable
         case let .found(account, value):
@@ -114,14 +135,14 @@ final class GitHubRefreshLock {
             let lock = try await GitHubRefreshLock.acquire(lockURL)
             defer { withExtendedLifetime(lock) {} }
             let current: GitHubSignedIn
-            switch saved() {
+            switch await saved() {
             case .found(let session): current = session
             case .missing: pending = nil; return .failure(.offline)
             case .unavailable: return .failure(.offline)
             }
             if let waiting = pending {
                 if current.login == waiting.previous.login && current.credential == waiting.previous.credential {
-                    guard write(waiting.next.login, waiting.next.credential.stored) else { return .failure(.offline) }
+                    guard await store(waiting.next, replacing: current) else { return .failure(.offline) }
                     pending = nil
                     return .success(waiting.next)
                 }
@@ -148,7 +169,7 @@ final class GitHubRefreshLock {
             // one removed during the network request or overwrite a replacement sign-in.
             let next = GitHubSignedIn(login: current.login, credential: grant)
             let latest: GitHubSignedIn
-            switch saved() {
+            switch await saved() {
             case .found(let session): latest = session
             case .missing: pending = nil; return .failure(.offline)
             case .unavailable:
@@ -156,13 +177,26 @@ final class GitHubRefreshLock {
                 return .failure(.offline)
             }
             guard latest.login == current.login && latest.credential == current.credential else { return .success(latest) }
-            guard write(next.login, grant.stored) else {
+            guard await store(next, replacing: current) else {
                 pending = (current, next)
                 return .failure(.offline)
             }
             NSLog("[vane] GitHub OAuth credential renewed")
             return .success(next)
         } catch { return .failure(.offline) }
+    }
+
+    func signOutFingerprints(for session: GitHubSignedIn) -> [Data] {
+        let original = session.fingerprint
+        guard let rotation = lastCommittedRotation, rotation.previous == original else { return [original] }
+        return [original, rotation.next]
+    }
+
+    private func store(_ next: GitHubSignedIn, replacing previous: GitHubSignedIn) async -> Bool {
+        let stored = if let commit { await commit(previous, next) }
+            else { write(next.login, next.credential.stored) }
+        if stored { lastCommittedRotation = (previous.fingerprint, next.fingerprint) }
+        return stored
     }
 
     private static func request(_ request: URLRequest) async -> Result<GitHubCredential, GitHub.Trouble> {
