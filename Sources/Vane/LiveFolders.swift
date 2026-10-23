@@ -762,18 +762,10 @@ enum GitHubOAuth {
          sendRefresh: GitHubTokenRenewal.Send? = nil,
          fetchPullRequests: ((GitHubQuery, String) async -> Result<[GitHub.PR], GitHub.Trouble>)? = nil) {
         self.profileID = profileID
-        let read = readCredential ?? {
-            Passwords.readCredential(host: LiveFolders.host, profileID: profileID)
-        }
+        let tokens = IntegrationTokens(profileID: profileID)
+        let read = readCredential ?? { tokens.read() }
         let write = storeCredential ?? { login, value in
-            guard Passwords.savePreferredCredential(host: LiveFolders.host, account: login,
-                                                    password: value, profileID: profileID) else { return false }
-            if case .unavailable(let status) = Passwords.deleteOtherCredentials(
-                host: LiveFolders.host, keeping: login, profileID: profileID
-            ) {
-                NSLog("[vane] GitHub credential saved but duplicate cleanup failed (status %d)", status)
-            }
-            return true
+            tokens.save(account: login, password: value)
         }
         self.readCredential = read
         self.storeCredential = write
@@ -782,7 +774,7 @@ enum GitHubOAuth {
             lockURL: Store.directory.appendingPathComponent("github-refresh-" + profileID.uuidString + ".lock"),
             read: read, write: write, secret: oauthSecret ?? { OAuthSecret.github }, send: sendRefresh)
         self.deleteCredential = deleteCredential ?? { account in
-            Passwords.delete(host: LiveFolders.host, account: account, profileID: profileID)
+            tokens.delete(account: account)
         }
     }
 
@@ -790,7 +782,7 @@ enum GitHubOAuth {
 
     /// The token, read from the keychain once and kept for the life of the process.
     ///
-    /// Not read per refresh: `Passwords.password` is a `SecItemCopyMatching` for plaintext,
+    /// Not read per refresh: integration-token lookup reads Keychain plaintext,
     /// which is the one keychain call that can put a panel up, and doing it on the main
     /// actor every five minutes is a hitch waiting for a slow keychain. `signOut` and a
     /// fresh sign-in are the only things that change it, and both go through here.
