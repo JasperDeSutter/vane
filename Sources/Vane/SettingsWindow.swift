@@ -1040,6 +1040,9 @@ private struct SearchPane: View {
     // Absent = off. Deliberately not defaulted on: turning this on sends what you type to
     // the search engine before you press Return.
     @AppStorage("searchSuggestions") private var suggestions = false
+    @AppStorage(Look.barVisibleRowsKey) private var visibleRows = Look.barVisibleRows
+    @AppStorage(Look.barTopKey) private var barTop = Look.barTop
+    @AppStorage(Look.barAnimationsKey) private var barAnimations = true
     // Neither list is @Published, so the views mirror them and refresh on every mutation.
     @State private var engines = Search.all
     @State private var newName = ""
@@ -1115,6 +1118,25 @@ private struct SearchPane: View {
                          + "search engine as you type it. Never in a private window, and never "
                          + "for anything that looks like an address. A custom engine's address "
                          + "needs %s where the search words go.")
+            }
+
+            SettingsCard {
+                SettingsRow("Results shown") {
+                    Stepper("\(Look.clampedVisibleRows(visibleRows))", value: $visibleRows,
+                            in: Look.barVisibleRowsRange)
+                }
+                SettingsRow("Bar position") {
+                    Slider(value: $barTop, in: Look.barTopRange) { Text("Bar position") }
+                        minimumValueLabel: { Text("Top") } maximumValueLabel: { Text("Middle") }
+                        .labelsHidden().frame(width: 220)
+                }
+                SettingsRow("Animate results") {
+                    Toggle("", isOn: $barAnimations).labelsHidden()
+                }
+                Footnote("The search bar keeps its place as results come and go. Results past "
+                         + "the count shown are a scroll away. With animation off, results "
+                         + "change at once as you type; Battery Saver and Reduce Motion also "
+                         + "turn it off.")
             }
 
             SettingsCard {

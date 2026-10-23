@@ -147,6 +147,14 @@ Medium, Etsy, Target, Dribbble, Behance, Unsplash, Pexels, GitLab, and DEV.to. F
 names work with `!` too, such as `!youtube` and `!github`; `twitter` and `!twitter`
 search X. Some sites require sign-in.
 
+### The search bar
+
+The search bar (`⌘T`, `⌘L`) keeps its place in the window while you type: results grow
+and shrink below the field, and the previous results stay up until the next ones
+arrive. **Settings → Profiles → Search Settings** sets **Results shown** (6–12 before the
+list scrolls), **Bar position** (from near the top of the window to its middle), and
+**Animate results**. Reduce Motion and Battery Saver also turn the animation off.
+
 ### Tab and history results
 
 Search ranks exact page titles and addresses before prefixes, partial words, and fuzzy

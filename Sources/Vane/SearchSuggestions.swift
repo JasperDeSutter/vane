@@ -176,6 +176,7 @@ import Foundation
     static func stream(_ query: String,
                        local: @escaping @MainActor @Sendable () async -> [Suggestion],
                        remote: @escaping @MainActor @Sendable () async -> [String],
+                       arrived: @MainActor (_ local: Bool, _ remote: Bool) -> Void = { _, _ in },
                        publish: @MainActor ([Suggestion]) -> Void) async {
         enum Result: Sendable {
             case local([Suggestion])
@@ -186,12 +187,16 @@ import Foundation
             group.addTask { .remote(await remote()) }
             var saved: [Suggestion] = []
             var phrases: [String] = []
+            var localIn = false, remoteIn = false
             for await result in group {
                 guard !Task.isCancelled else { group.cancelAll(); return }
                 switch result {
-                case .local(let rows): saved = rows
-                case .remote(let rows): phrases = rows
+                case .local(let rows): saved = rows; localIn = true
+                case .remote(let rows): phrases = rows; remoteIn = true
                 }
+                // In the same turn as the rows, so a reader never sees a half marked in
+                // before its rows are, or an empty answer mistaken for one still coming.
+                arrived(localIn, remoteIn)
                 publish(merge(query, local: saved, remote: phrases))
             }
         }

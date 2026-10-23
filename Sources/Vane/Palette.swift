@@ -61,6 +61,45 @@ enum Palette {
 
     }
 
+    /// What to show while a query's results are still arriving. History and the engine
+    /// answer separately, in either order: each source keeps the last query's rows until its
+    /// own new ones are in, so neither half collapses and refills under the reader. Once
+    /// nothing is pending, exactly the live rows — even none.
+    static func heldResults<T, ID: Hashable>(live: [T], held: [T], historyPending: Bool,
+                                             enginePending: Bool, isCompletion: (T) -> Bool,
+                                             id: (T) -> ID) -> [T] {
+        let history = live.filter { !isCompletion($0) }
+        let completions = live.filter(isCompletion)
+        // A half that has answered — even with nothing — replaces its held rows.
+        let keptHistory = historyPending && history.isEmpty ? held.filter { !isCompletion($0) } : history
+        let ids = Set(keptHistory.map(id))
+        return keptHistory + (enginePending && completions.isEmpty
+            ? held.filter { isCompletion($0) && !ids.contains(id($0)) } : completions)
+    }
+
+    static func rowsHeight(_ count: Int) -> CGFloat {
+        let n = CGFloat(count)
+        return n * Look.barRowHeight + max(0, n - 1) * Look.barRowGap
+    }
+
+    /// How many result rows the bar may draw: what Search Settings asks for, but never more
+    /// than fit the window under `chrome` (field, divider, padding and the bar's insets), so
+    /// the list's last rows stay on screen and in reach of scrolling. Always at least one.
+    static func fittingRows(_ wanted: Int, windowHeight: CGFloat, chrome: CGFloat) -> Int {
+        let room = windowHeight - chrome - Look.inset * 2
+        // Before the first layout the height is unknown (infinite); nothing to cut yet.
+        let rows = ((room + Look.barRowGap) / (Look.barRowHeight + Look.barRowGap)).rounded(.down)
+        guard rows.isFinite else { return max(1, wanted) }
+        return max(1, min(wanted, Int(max(0, rows))))
+    }
+
+    /// The slot drawn as hovered. Results are rewritten in place under a still pointer, so
+    /// hover belongs to the slot, not to whichever result stood in it; a slot the list no
+    /// longer has is not lit.
+    static func litSlot(hover: Int?, rowCount: Int) -> Int? {
+        hover.flatMap { $0 < rowCount ? $0 : nil }
+    }
+
     /// The bar before a character is typed (ref 2). Arc's ⌘T opens on this window's own
     /// tabs, most recently used first — `TabSwitcher.recent`'s order, the one ⌃⇥ walks —
     /// capped so the bar stays a glance, with one row under them to report a problem.
@@ -594,7 +633,9 @@ struct CommandField: NSViewRepresentable {
     /// In-memory rows refresh immediately; database suggestions arrive separately.
     @State private var rows: [PaletteRow] = []
     @State private var layout = Feel03PaletteLayout<PaletteRow>()
-    @State private var hover: String?
+    /// The slot under the pointer. Slots are rewritten in place, so hover follows the
+    /// slot, not whichever row last stood in it.
+    @State private var hover: Int?
     /// Arc's ⇥: the bar narrows to its actions catalogue and says so with a scope chip in
     /// the field. Escape takes the filter off before it closes the bar.
     @State private var actionsOnly = false
@@ -605,14 +646,35 @@ struct CommandField: NSViewRepresentable {
     @State private var acceptingInput = true
     @State private var fieldFocusRequest = 0
     @State private var scrollRequest = 0
+    @State private var listPosition = ScrollPosition()
+    /// The last query's history and engine rows, held while this query's are pending so
+    /// the list does not collapse to its defaults and refill on every keystroke.
+    @State private var heldSuggestions: [PaletteRow] = []
+    /// The window's height, for capping the results to what fits under the field.
+    @State private var windowHeight: CGFloat = .infinity
     /// Every open tab, in every window: a title or favicon arriving redraws the row for it.
     @StateObject private var tabs = ChangeWatch()
+    // `.vane`, the store Search Settings writes through, so a `VANE_DATA_DIR` instance
+    // reads its own choices rather than the regular app's.
+    @AppStorage(Look.barVisibleRowsKey, store: .vane) private var visibleRows = Look.barVisibleRows
+    @AppStorage(Look.barTopKey, store: .vane) private var barTop = Look.barTop
+    @AppStorage(Look.barAnimationsKey, store: .vane) private var animations = true
 
-    /// At most `Look.barVisibleRows` are visible; the rest are a scroll away. Arithmetic
+    /// At most `visibleRows` are visible; the rest are a scroll away. Arithmetic
     /// rather than a preference-key measuring dance, which the fixed row height makes exact.
     private var listHeight: CGFloat {
-        let n = CGFloat(min(rows.count, Look.barVisibleRows))
-        return n * Look.barRowHeight + max(0, n - 1) * Look.barRowGap
+        rowsHeight(min(rows.count, rowCap))
+    }
+    private func rowsHeight(_ count: Int) -> CGFloat { Palette.rowsHeight(count) }
+    /// Search Settings' row count, cut to what fits the window.
+    private var rowCap: Int {
+        Palette.fittingRows(Look.clampedVisibleRows(visibleRows), windowHeight: windowHeight,
+                            chrome: chromeHeight + 1 + listPadding)
+    }
+    /// Everything in the bar but the rows.
+    private var chromeHeight: CGFloat {
+        fieldHeight + (mode == .tabs && !store.isPrivate && !store.isLittle && !actionsOnly
+                       ? Look.control + Look.barRowGap : 0)
     }
     /// Above and below the rows: a row gap's less at the top, where the divider already
     /// separates, than at the bottom, where the bar's edge has to.
@@ -626,10 +688,20 @@ struct CommandField: NSViewRepresentable {
                        ? Look.control + Look.barRowGap : 0)
             + (rows.isEmpty ? 0 : 1 + listHeight + listPadding)
     }
+    /// The search bar's top edge stays put while results arrive and leave, so the field
+    /// does not chase the list's height. It is clamped against the tallest the list can
+    /// get, so a short window moves it once, not per keystroke.
+    private func searchTop(_ height: CGFloat) -> CGFloat {
+        let chrome = barHeight - (rows.isEmpty ? 0 : 1 + listHeight + listPadding)
+        let tallest = chrome + 1 + rowsHeight(rowCap) + listPadding
+        return max(Look.inset, min(height * Look.clampedBarTop(barTop),
+                                   height - tallest - Look.inset))
+    }
 
-    /// Nil under Reduce Motion, which SwiftUI reads as "just change".
+    /// Nil under Reduce Motion, Battery Saver or the Search Settings switch, which SwiftUI
+    /// reads as "just change".
     private func motion(_ a: Animation) -> Animation? {
-        reduceMotion || batterySaver.isActive ? nil : a
+        reduceMotion || batterySaver.isActive || !animations ? nil : a
     }
 
     private var bangCandidate: Bangs.Activation? {
@@ -666,16 +738,17 @@ struct CommandField: NSViewRepresentable {
                     .scaleEffect(shown ? 1 : Look.appearScale)
                     .opacity(shown ? 1 : 0)
                     // Editing the current address opens over the sidebar pill. Other
-                    // search modes retain their centered layout.
+                    // search modes sit at the position chosen in Search Settings.
                     .padding(.leading, sidebarAddress ? Look.inset : 0)
                     .padding(.top, max(Look.inset,
-                                       min(sidebarAddress ? sidebarLayout.addressTop
-                                           : (geo.size.height - barHeight) / 2,
-                                           geo.size.height - barHeight - Look.inset)))
+                                       sidebarAddress
+                                           ? min(sidebarLayout.addressTop,
+                                                 geo.size.height - barHeight - Look.inset)
+                                           : searchTop(geo.size.height)))
                     .animation(motion(Look.quick), value: rows.count)
-                    .animation(reduceMotion || batterySaver.isActive ? nil : Look.quick,
-                               value: sidebarLayout.stacked)
+                    .animation(motion(Look.quick), value: sidebarLayout.stacked)
             }
+            .onChange(of: geo.size.height, initial: true) { _, height in windowHeight = height }
         }
         .vaneMotionPolicy()
         .onDisappear {
@@ -715,6 +788,8 @@ struct CommandField: NSViewRepresentable {
         // Search Tabs can replace the mode of an already-open bar. SwiftUI keeps
         // its state in that case, so rows/scopes must refresh without another onAppear.
         .onChange(of: mode) {
+            // Held rows answered another scope; they must not stand in for this one.
+            heldSuggestions = []
             actionsOnly = false
             activeBang = nil
             tabSpaceID = nil
@@ -726,6 +801,9 @@ struct CommandField: NSViewRepresentable {
         // grow under the user without moving what they had already arrowed onto. The same
         // goes for a tab that renames itself or gets its favicon while the bar is up.
         .onChange(of: store.suggestions) { refresh(reset: false, rebuildLocal: false) }
+        .onChange(of: store.suggestionsPending) { refresh(reset: false, rebuildLocal: false) }
+        .onChange(of: store.historyPending) { refresh(reset: false, rebuildLocal: false) }
+        .onChange(of: store.enginePending) { refresh(reset: false, rebuildLocal: false) }
         // ChangeWatch invalidates the body on a tab notification; compare only
         // result/action content before rebuilding, including store-driven changes.
         .onChange(of: currentTabContent) { refresh(reset: false) }
@@ -871,7 +949,10 @@ struct CommandField: NSViewRepresentable {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: Look.barRowGap) {
-                    ForEach(Array(rows.enumerated()), id: \.element.id) { i, row in
+                    // Slots, not rows: a keystroke rewrites each slot in place rather than
+                    // fading out one row and fading in another where it stood. Only slots
+                    // added or removed at the bottom animate.
+                    ForEach(Array(rows.enumerated()), id: \.offset) { i, row in
                         line(i, row)
                     }
                 }
@@ -880,19 +961,20 @@ struct CommandField: NSViewRepresentable {
             }
             .frame(height: listHeight + listPadding)
             .scrollIndicators(.never)
-            .onChange(of: scrollRequest) {
-                if let first = rows.first { proxy.scrollTo(first.id, anchor: .top) }
-            }
+            .scrollPosition($listPosition)
+            // The scroll view's edge, not the first row's: aligning the row would scroll
+            // the list's top padding away whenever there are enough results to scroll.
+            .onChange(of: scrollRequest) { listPosition.scrollTo(edge: .top) }
             .onChange(of: index) {
                 guard rows.indices.contains(index) else { return }
-                proxy.scrollTo(rows[index].id)
+                proxy.scrollTo(index)
             }
         }
     }
 
     private func line(_ i: Int, _ row: PaletteRow) -> some View {
         let on = i == index
-        let lit = hover == row.id
+        let lit = Palette.litSlot(hover: hover, rowCount: rows.count) == i
         return HStack(spacing: Look.barRowSpacing) {
             if let image = row.image {
                 SiteIcon(icon: image, size: Look.rowIcon, rounded: !row.detail.hasPrefix("file:"))
@@ -965,8 +1047,8 @@ struct CommandField: NSViewRepresentable {
         .animation(motion(Look.quick), value: lit)
         .padding(.horizontal, Look.barInset)
         .contentShape(.rect)
-        .id(row.id)
-        .onHover { hover = $0 ? row.id : (hover == row.id ? nil : hover) }
+        .id(i)
+        .onHover { hover = $0 ? i : (hover == i ? nil : hover) }
         .onTapGesture { index = i; activate() }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(row.title)
@@ -1035,6 +1117,8 @@ struct CommandField: NSViewRepresentable {
             seededAddress = nil
             query = activation.query
         }
+        // The unscoped rows are other sites' history and engine phrases the scope excludes.
+        heldSuggestions = []
         store.suggest(typed, scopedTo: activation.engine)
         refresh()
         axAnnounce("Searching \(activation.engine.name). Escape leaves site search.")
@@ -1042,6 +1126,7 @@ struct CommandField: NSViewRepresentable {
 
     private func leaveBang() {
         withAnimation(motion(Look.quick)) { activeBang = nil }
+        heldSuggestions = []
         store.suggest(typed)
         refresh()
         axAnnounce("Site search off.")
@@ -1181,7 +1266,7 @@ struct CommandField: NSViewRepresentable {
             }
             layout = fresh
         }
-        let out = layout.rows(suggestions: layout.acceptsSuggestions ? suggestionRows() : [])
+        let out = layout.rows(suggestions: layout.acceptsSuggestions ? shownSuggestions() : [])
         // A cap so a bar over a hundred open tabs stays a list and not a scroll marathon —
         // but not while ⇥ is on, where the tail of the catalogue is the whole point.
         let visible = actionsOnly ? out : Feel03PaletteLayout.visible(out, limit: 24,
@@ -1230,6 +1315,22 @@ struct CommandField: NSViewRepresentable {
             // go() resolves bangs, assistants, urls and searches — all of it, in that order.
             target().go(text)
         }
+    }
+
+    /// The last query's rows stay, all of them, until this query's own results are in —
+    /// then those replace them, even when empty. Filtering them to the new text emptied the
+    /// list whenever they were fuzzy matches, which flashed the bar's defaults for a frame.
+    /// History and engine completions land separately; until the engine's do, the last
+    /// query's completions stay under the new history instead of vanishing and returning.
+    private func shownSuggestions() -> [PaletteRow] {
+        let shown = Palette.heldResults(live: suggestionRows(), held: heldSuggestions,
+                                        historyPending: store.historyPending,
+                                        enginePending: store.enginePending,
+                                        isCompletion: { $0.kind == "Search suggestion" }, id: \.id)
+        // Held is always what is on screen: typing faster than the engine answers must
+        // still carry the newest history forward, not the list from before it arrived.
+        heldSuggestions = shown
+        return shown
     }
 
     /// History, bookmarks and engine completions, in the order `TabStore.suggest` merged

@@ -103,6 +103,22 @@ enum Look {
     static let barRowGap: CGFloat = 4
     /// How many rows the bar draws before the rest are a scroll away.
     static let barVisibleRows = 8
+    /// Search Settings can show more or fewer rows; never fewer than the bar at rest needs.
+    static let barVisibleRowsKey = "searchBarVisibleRows"
+    static let barVisibleRowsRange = (barEmptyTabs + 1)...12
+    static func clampedVisibleRows(_ n: Int) -> Int {
+        min(max(n, barVisibleRowsRange.lowerBound), barVisibleRowsRange.upperBound)
+    }
+    /// Where the search bar's top edge sits, as a fraction of the window's height. A
+    /// quarter down is where a full list of `barVisibleRows` used to centre itself.
+    static let barTopKey = "searchBarTop"
+    /// Off makes the bar change at once: rows, height and scope chips stop easing.
+    static let barAnimationsKey = "searchBarAnimations"
+    static let barTop = 0.25
+    static let barTopRange = 0.05...0.5
+    static func clampedBarTop(_ f: Double) -> CGFloat {
+        CGFloat(min(max(f, barTopRange.lowerBound), barTopRange.upperBound))
+    }
     /// How many of this window's tabs the bar lists with nothing typed. Arc's ⌘T opens on a
     /// short most-recently-used list rather than the whole strip: the tab you want is nearly
     /// always the one you were just on, and anything further back is one typed letter away.
@@ -959,7 +975,13 @@ extension Look {
         out.append(("the bar at rest is a glance at the recent tabs, not the whole strip",
                     barEmptyTabs >= 4 && barEmptyTabs < tidyThreshold))
         out.append(("…and it never opens scrolling: those tabs and the row under them fit",
-                    barEmptyTabs + 1 <= barVisibleRows))
+                    barEmptyTabs + 1 <= barVisibleRowsRange.lowerBound
+                        && barVisibleRowsRange.contains(barVisibleRows)
+                        && clampedVisibleRows(0) == barEmptyTabs + 1
+                        && clampedVisibleRows(99) == 12))
+        out.append(("the search bar's top stays on screen at any saved position",
+                    barTopRange.contains(barTop) && clampedBarTop(-1) == 0.05
+                        && clampedBarTop(2) == 0.5))
         out.append(("a stand-in letter fills a favicon's box without touching its edges",
                     letterScale > 0.5 && letterScale < 1))
         out.append(("housekeeping waits for a pile: more tabs than fit in a glance, "

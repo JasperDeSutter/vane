@@ -2450,6 +2450,14 @@ struct Stash {
         }
     }
     @Published var suggestions: [Suggestion] = []
+    /// True from a query's first keystroke until both its history and engine halves are in.
+    /// `suggestions` is always the current query's; the bar reads this to know whether an
+    /// empty list is an answer or still on its way.
+    @Published private(set) var suggestionsPending = false
+    /// Each half on its own: an empty history answer has arrived even while the engine is
+    /// still on its way, and must not read as "history still coming".
+    @Published private(set) var historyPending = false
+    @Published private(set) var enginePending = false
     /// -1 means "no suggestion highlighted" — Enter then uses what was typed.
     @Published var suggestionIndex = -1
 
@@ -2463,7 +2471,15 @@ struct Stash {
         suggestTask?.cancel()
         if !suggestions.isEmpty { suggestions = [] }
         if suggestionIndex != -1 { suggestionIndex = -1 }
-        guard !isPrivate, query.trimmingCharacters(in: .whitespaces).count >= 2 else { return }
+        guard !isPrivate, query.trimmingCharacters(in: .whitespaces).count >= 2 else {
+            if suggestionsPending { suggestionsPending = false }
+            if historyPending { historyPending = false }
+            if enginePending { enginePending = false }
+            return
+        }
+        if !suggestionsPending { suggestionsPending = true }
+        if !historyPending { historyPending = true }
+        if !enginePending { enginePending = true }
         let history = history
         suggestTask = Task { [weak self] in
             await SearchSuggestions.stream(query, local: {
@@ -2474,10 +2490,18 @@ struct Stash {
                 // Scoped queries stay local; private windows never enter this task.
                 guard engine == nil else { return [] }
                 return await SearchSuggestions.fetch(query)
+            }, arrived: { [weak self] local, remote in
+                guard let self else { return }
+                if self.historyPending == local { self.historyPending = !local }
+                if self.enginePending == remote { self.enginePending = !remote }
             }, publish: { [weak self] rows in
                 guard let self, self.suggestions != rows else { return }
                 self.suggestions = rows
             })
+            guard !Task.isCancelled else { return }
+            self?.suggestionsPending = false
+            self?.historyPending = false
+            self?.enginePending = false
         }
     }
 
@@ -2486,7 +2510,10 @@ struct Stash {
         suggestionIndex = max(-1, min(suggestions.count - 1, suggestionIndex + delta))
     }
 
-    func clearSuggestions() { suggestTask?.cancel(); suggestions = []; suggestionIndex = -1 }
+    func clearSuggestions() {
+        suggestTask?.cancel(); suggestions = []; suggestionIndex = -1; suggestionsPending = false
+        historyPending = false; enginePending = false
+    }
 
     let isPrivate: Bool
     /// A Little Arc window: one page, no sidebar, no Space. It shares the profile's cookies
