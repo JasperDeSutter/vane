@@ -126,7 +126,15 @@ Vane does not provide native messaging hosts, replacement browser pages, extensi
 panels, developer-tools panels, omnibox keywords, or Chrome OAuth integration. Native
 messaging has public WebKit hooks, but Vane has no approved host-execution mechanism:
 `runtime.connectNative` is unavailable, and `runtime.sendNativeMessage` fails after a short
-pause, so Safari builds that poll their own app keep running without it. ZIP/native-host feasibility, exact upstream package provenance, regression scope, and
+pause, so Safari builds that poll their own app keep running without it.
+
+Safari builds of Bitwarden send a few commands to their app that Vane carries out itself:
+copying to the clipboard (with `clipboardWrite`), reading back only the extension's own
+unchanged copy so it can clear it later, opening the extension's popup, saving an export
+through a save panel you confirm, and its 10-second vault-timeout pause. Biometric unlock
+and other commands that need the Bitwarden desktop app still fail.
+
+ZIP/native-host feasibility, exact upstream package provenance, regression scope, and
 assembled-app results are in [Extension validation](EXTENSION-VALIDATION.md). No Vane
 backend or account is required.
 

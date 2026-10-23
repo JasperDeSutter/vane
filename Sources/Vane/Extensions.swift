@@ -1101,12 +1101,18 @@ import WebKit
 
     // MARK: WKWebExtensionControllerDelegate
 
-    /// Vane runs no native host, so every message fails. Unimplemented, WebKit would never
-    /// answer at all, leaving callers waiting forever; answering at once makes polling loops
-    /// spin. The pause keeps them at roughly the pace a real host would set.
+    /// Vane runs no native host. Commands it can carry out itself are answered here (see
+    /// `ExtensionAppMessages`); everything else fails. Unimplemented, WebKit would look the
+    /// extension's app handler up through PlugInKit, which refuses every host but Safari, and
+    /// fail at once, which makes polling loops spin. The pause keeps them at roughly the pace
+    /// a real host would set.
     func webExtensionController(_ controller: WKWebExtensionController, sendMessage message: Any,
                                 toApplicationWithIdentifier applicationIdentifier: String?,
                                 for extensionContext: WKWebExtensionContext) async throws -> Any? {
+        let answer = try await appMessages.answer(message, to: applicationIdentifier, from: extensionContext) {
+            run(extensionContext, for: nil, from: nil)
+        }
+        if case .reply(let reply) = answer { return reply }
         try await Task.sleep(for: ExtensionDiagnostics.nativeMessageFailureDelay)
         throw Failure("Vane does not connect extensions to native applications.")
     }
@@ -1267,8 +1273,10 @@ import WebKit
 
     private var pages: [(context: WKWebExtensionContext, window: NSWindow)] = []
     private var popovers: [ObjectIdentifier: [NSPopover]] = [:]
+    let appMessages = ExtensionAppMessages()
 
     private func closePages(for context: WKWebExtensionContext) {
+        appMessages.forget(context)
         for popover in popovers.removeValue(forKey: ObjectIdentifier(context)) ?? [] { popover.close() }
         for page in pages where page.context === context {
             (page.window.contentView as? WKWebView)?.stopLoading()
