@@ -3483,7 +3483,9 @@ struct SidebarRow<Leading: View, Label: View, Trailing: View>: View {
     @Environment(\.ghostTileMorph) private var morph
 
     var body: some View {
-        HStack(spacing: Look.rowSpacing) {
+        // Spacing sits only between the icon and the title. The title runs straight up to
+        // the trailing controls, whose pressable squares already hold their glyphs clear.
+        HStack(spacing: 0) {
             leading().opacity(morph == nil ? 1 : 0)
                 .animation(reduceMotion || batterySaver.isActive ? nil : Look.quick, value: hovering)
                 .vaneMotionPolicy()
@@ -3492,6 +3494,7 @@ struct SidebarRow<Leading: View, Label: View, Trailing: View>: View {
             label().font(Look.rowTitle).lineLimit(1)
                 .foregroundStyle(dimmed ? Look.inkTertiary : Look.inkPrimary)
                 .opacity(1 - (morph?.progress ?? 0))
+                .padding(.leading, Look.rowSpacing)
             Spacer(minLength: 0)
             trailing().opacity(1 - (morph?.progress ?? 0))
                 .animation(reduceMotion || batterySaver.isActive ? nil : Look.quick, value: hovering)
@@ -4778,8 +4781,11 @@ private struct TabRowTrailing: View {
             // unloaded, so the swap is the same fade the rest of the row uses rather
             // than a cut from − to ×.
             .contentTransition(reduced ? .identity : .symbolEffect(.replace))
-            // Reserve the target so revealing it cannot retruncate the title.
+            // Hidden, the × gives its width back to the title; under the pointer it takes
+            // it again and the title shortens beside it.
             // Hidden controls never take input or keyboard focus.
+            .frame(width: hovering ? Look.rowTarget : 0, alignment: .trailing)
+            .clipped()
             .opacity(hovering ? 1 : 0)
             .allowsHitTesting(hovering)
             .disabled(!hovering)

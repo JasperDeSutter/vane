@@ -25,6 +25,8 @@ Showing or hiding the sidebar applies across all Spaces in that window, includin
 in other profiles. Each window keeps its own sidebar visibility.
 
 Hover a sidebar tab to see a compact name tooltip and a **Double-click to rename** hint.
+The tab's close button appears at the end of the row while you hover; otherwise the
+title uses the row's full width.
 Double-click a Today tab, pinned tab, favourite, or split pane to edit its name in
 place. Press **Return** to save or **Escape** to cancel; an empty name restores the
 page’s title.
