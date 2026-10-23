@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import vane
 
 @MainActor final class SearchRankingTests: XCTestCase {
@@ -55,6 +56,26 @@ import XCTest
         XCTAssertFalse(Palette.strong("tu", title: "Giant Purple Turtles", url: "https://example.com"))
         XCTAssertFalse(Palette.strong("gpt", title: "Giant Purple Turtles", url: "https://example.com"))
         XCTAssertGreaterThan(Palette.score("doc", "mydoc doc")!, Palette.score("doc", "mydocdoc")!)
+    }
+
+    func testInlineCompletionFillsOnlyTheStartOfAVisitedHost() {
+        let urls = ["https://docs.google.com/x", "https://www.deepseek.com/chat"]
+        XCTAssertEqual(Palette.completeHost("d", urls: urls)?.text, "docs.google.com")
+        XCTAssertEqual(Palette.completeHost("d", urls: urls)?.url.absoluteString, "https://docs.google.com/",
+                       "Return opens the site's origin, not the visited page")
+        let deep = Palette.completeHost("DE", urls: urls)
+        XCTAssertEqual(deep?.text, "deepseek.com", "www. and case are ignored")
+        XCTAssertEqual(deep?.url.absoluteString, "https://www.deepseek.com/", "…but the real host is kept")
+        let local = Palette.completeHost("loc", urls: ["http://localhost:3000/path"])
+        XCTAssertEqual(local?.text, "localhost:3000")
+        XCTAssertEqual(local?.url.absoluteString, "http://localhost:3000/", "a port survives")
+        XCTAssertEqual(Palette.completeHost("se", urls: ["http://server/wiki"])?.url.absoluteString,
+                       "http://server/", "a single-label host opens rather than searches")
+        XCTAssertNil(Palette.completeHost("fi", urls: ["file:///Users/me/notes.txt"]), "only web origins")
+        XCTAssertNil(Palette.completeHost("seek", urls: urls), "the middle of a host is not its start")
+        XCTAssertNil(Palette.completeHost("deepseek.com", urls: urls), "a fully typed host has no tail")
+        XCTAssertNil(Palette.completeHost("de ep", urls: urls), "a space means a search")
+        XCTAssertNil(Palette.completeHost("", urls: urls))
     }
 
     func testURLMatchesAndLiteralWildcardsStayPredictable() throws {
@@ -118,5 +139,78 @@ import XCTest
         XCTAssertEqual(Palette.fittingRows(8, windowHeight: 100, chrome: chrome), 1, "never fewer than one")
         XCTAssertEqual(Palette.fittingRows(8, windowHeight: .infinity, chrome: chrome), 8,
                        "before the first layout the window's height is unknown")
+    }
+
+    func testFirstLetterCompletesAHistoryOnlySite() {
+        // At one character history suggestions are empty and no tab matches; only the
+        // first-letter lookup knows the site, and only for the letter it was made for.
+        let lookup = (query: "d", urls: ["https://www.deepseek.com/chat"])
+        let sources = Palette.completionSources(typed: "d", history: [], held: [],
+                                                firstLetter: lookup, tabs: ["https://example.com/"])
+        XCTAssertEqual(Palette.completeHost("d", urls: sources)?.text, "deepseek.com")
+        XCTAssertTrue(Palette.completionSources(typed: "x", history: [], held: [],
+                                                firstLetter: lookup, tabs: []).isEmpty,
+                      "a lookup for another letter is not used")
+        XCTAssertEqual(Palette.completionSources(typed: "d", history: ["https://docs.google.com/"],
+                                                 held: [], firstLetter: lookup, tabs: []).first,
+                       "https://docs.google.com/", "this query's own history ranks first")
+    }
+
+    func testAcceptedCompletionKeepsItsOriginUntilTheNextEdit() throws {
+        let server = try XCTUnwrap(Palette.completeHost("se", urls: ["http://server/wiki"]))
+        // → / End / ← / Home / a click commit "server" to the query while `server` is the
+        // completion: Return must still open http://server/, not search for "server".
+        let accepted = Palette.carriedCompletion(nil, completion: server, query: "server")
+        XCTAssertEqual(accepted?.url.absoluteString, "http://server/")
+        XCTAssertEqual(Palette.carriedCompletion(accepted, completion: nil, query: "server")?.url,
+                       server.url, "still standing once the completion itself is gone")
+        XCTAssertEqual(Palette.carriedCompletion(accepted, completion: nil, query: "SERVER")?.url,
+                       server.url, "case typed before the tail does not matter")
+        XCTAssertNil(Palette.carriedCompletion(accepted, completion: nil, query: "server/x"),
+                     "the next edit lets it go")
+        XCTAssertNil(Palette.carriedCompletion(nil, completion: server, query: "se"),
+                     "a completion still showing is not yet accepted")
+    }
+
+    @MainActor
+    func testMovingTheCaretOffAnInlineCompletionAcceptsIt() {
+        var query = "se"
+        let field = CommandField(text: Binding(get: { query }, set: { query = $0 }), prompt: "",
+                                 selectAll: false, label: "", hint: "", onKey: { _ in false })
+        let coordinator = field.makeCoordinator()
+        let editor = NSTextView()
+        editor.string = "server"
+        func move(to range: NSRange) {
+            coordinator.showsCompletion = true
+            query = "se"
+            editor.setSelectedRange(range)
+            coordinator.selectionMoved(in: editor)
+        }
+        move(to: NSRange(location: 2, length: 4))
+        XCTAssertEqual(query, "se", "the tail still selected is still a completion")
+        move(to: NSRange(location: 6, length: 0))
+        XCTAssertEqual(query, "server", "→ or End accepts the whole host")
+        XCTAssertFalse(coordinator.showsCompletion)
+        move(to: NSRange(location: 2, length: 0))
+        XCTAssertEqual(query, "server", "← or a click accepts it too, so the next key edits what is shown")
+        coordinator.showsCompletion = true
+        query = "se"
+        editor.string = "se"
+        editor.setSelectedRange(NSRange(location: 2, length: 0))
+        coordinator.selectionMoved(in: editor)
+        XCTAssertEqual(query, "se", "deleting the tail is not an acceptance")
+        XCTAssertTrue(coordinator.showsCompletion, "…it is left for the text-change path to dismiss")
+    }
+
+    func testCompletionFollowsTypingForwardIncludingOverTheSeededAddress() {
+        XCTAssertTrue(Palette.typesForward(from: "de", to: "dee", seeded: nil))
+        XCTAssertFalse(Palette.typesForward(from: "dee", to: "de", seeded: nil), "a delete turns it off")
+        XCTAssertFalse(Palette.typesForward(from: "deep", to: "dexp", seeded: nil), "an edit in the middle too")
+        let address = "https://github.com/notnaki/vane"
+        XCTAssertTrue(Palette.typesForward(from: address, to: "g", seeded: address),
+                      "the first character typed over ⌘L's selected address completes")
+        XCTAssertFalse(Palette.typesForward(from: address, to: "", seeded: address), "clearing it does not")
+        XCTAssertFalse(Palette.typesForward(from: "github.com/x", to: "g", seeded: address),
+                       "only the address ⌘L opened with counts as a replacement")
     }
 }

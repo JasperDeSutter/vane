@@ -155,6 +155,10 @@ arrive. **Settings → Profiles → Search Settings** sets **Results shown** (6�
 list scrolls), **Bar position** (from near the top of the window to its middle), and
 **Animate results**. Reduce Motion and Battery Saver also turn the animation off.
 
+Typing the start of a site you have visited or have open completes its address in the
+field, with the added part selected, and **Return** opens it. Keep typing to narrow it,
+press **Delete** to remove the completion, or press **→** to accept it and keep editing.
+
 ### Tab and history results
 
 Search ranks exact page titles and addresses before prefixes, partial words, and fuzzy
