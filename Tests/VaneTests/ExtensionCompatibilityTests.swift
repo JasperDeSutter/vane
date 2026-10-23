@@ -165,4 +165,52 @@ import XCTest
         }
     }
 
+    func testExtensionPagesIdentifyAsSafari() async throws {
+        let host = ExtensionHost.host(for: profile)
+        for version in [2, 3] {
+            var manifest: [String: Any] = ["manifest_version": version, "name": "User Agent Fixture", "version": "1.0",
+                "options_ui": ["page": "options.html"]]
+            manifest["background"] = version == 2 ? ["scripts": ["background.js"], "persistent": true] as [String: Any]
+                : ["service_worker": "background.js"]
+            try JSONSerialization.data(withJSONObject: manifest).write(to: folder.appendingPathComponent("manifest.json"))
+            try Data("browser.runtime.onMessage.addListener(async () => navigator.userAgent);".utf8)
+                .write(to: folder.appendingPathComponent("background.js"))
+            let context = try await load()
+            let web = try await options(context)
+            let page = try await web.callAsyncJavaScript("return navigator.userAgent;",
+                arguments: [:], in: nil, contentWorld: .page) as? String
+            let background = try await web.callAsyncJavaScript("return await browser.runtime.sendMessage({});",
+                arguments: [:], in: nil, contentWorld: .page) as? String
+            // Bitwarden's getDevice() looks for " Safari/" and finds no browser without it.
+            for agent in [page, background] {
+                XCTAssertTrue(agent?.hasSuffix(BrowserIdentity.applicationName) == true, "MV\(version): \(agent ?? "nil")")
+            }
+            host.remove(context)
+        }
+    }
+
+    func testUncaughtBackgroundErrorIsShownWithoutBlockingInstall() async throws {
+        let host = ExtensionHost.host(for: profile)
+        try JSONSerialization.data(withJSONObject: ["manifest_version": 2, "name": "Throwing Fixture", "version": "1.0",
+            "options_ui": ["page": "options.html"], "background": ["scripts": ["background.js"], "persistent": true]])
+            .write(to: folder.appendingPathComponent("manifest.json"))
+        try Data("""
+            browser.runtime.onMessage.addListener(async () => 'alive');
+            throw new Error('Fixture background failure');
+            """.utf8).write(to: folder.appendingPathComponent("background.js"))
+        let context = try await load()
+        XCTAssertTrue(context.errors.contains { error in
+            let value = error as NSError
+            return value.domain == WKWebExtensionContext.errorDomain
+                && value.code == ExtensionDiagnostics.uncaughtScriptErrorCode
+                && value.localizedDescription.contains("Fixture background failure")
+        }, "\(context.errors)")
+        let web = try await options(context)
+        let reply = try await web.callAsyncJavaScript("return await browser.runtime.sendMessage({});",
+            arguments: [:], in: nil, contentWorld: .page) as? String
+        XCTAssertEqual(reply, "alive")
+        XCTAssertTrue(host.entries.first?.failure?.contains("Fixture background failure") == true)
+        host.remove(context)
+    }
+
 }

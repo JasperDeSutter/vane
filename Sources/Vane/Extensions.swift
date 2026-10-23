@@ -155,6 +155,12 @@ import WebKit
                 .map(WKWebExtensionController.Configuration.init(identifier:))
                 ?? WKWebExtensionController.Configuration.default()
         configuration.defaultWebsiteDataStore = ProfileManager.dataStore(for: profileID)
+        // Tabs carry a full Safari user agent, but background, popup and options pages only
+        // get what WebKit appends to its bare "(KHTML, like Gecko)". Without this they name no
+        // browser at all, and extensions that branch on it (Bitwarden) fail to start.
+        let pages: WKWebViewConfiguration = configuration.webViewConfiguration
+        pages.applicationNameForUserAgent = BrowserIdentity.applicationName
+        configuration.webViewConfiguration = pages
         controller = WKWebExtensionController(configuration: configuration)
         super.init()
         controller.delegate = self
@@ -465,7 +471,7 @@ import WebKit
                 try controller.load(context)
                 if ext.hasBackgroundContent { try await context.loadBackgroundContent() }
                 try checkLifetime()
-                let errors = ExtensionDiagnostics.blockingErrors(context.errors, manifest: manifest)
+                let errors = ExtensionDiagnostics.activationErrors(context.errors, manifest: manifest)
                 guard errors.isEmpty else { throw Failure(ExtensionDiagnostics.describe(errors)) }
             }
             try checkLifetime()
@@ -548,7 +554,7 @@ import WebKit
         context.isInspectable = Settings.inspectorEnabled
         context.inspectionName = ext.displayName
         context.unsupportedAPIs = ExtensionDiagnostics.unsupportedAPIs
-        for permission in ext.requestedPermissions where !ExtensionDiagnostics.unsupportedPermissions.contains(permission.rawValue) {
+        for permission in ext.requestedPermissions {
             context.setPermissionStatus(.grantedExplicitly, for: permission)
         }
         for pattern in ext.requestedPermissionMatchPatterns.union(ext.allRequestedMatchPatterns) { context.setPermissionStatus(.grantedExplicitly, for: pattern) }
@@ -571,7 +577,7 @@ import WebKit
             try controller.load(context)
             if ext.hasBackgroundContent { try await context.loadBackgroundContent() }
             try checkLifetime()
-            let errors = ExtensionDiagnostics.blockingErrors(context.errors, manifest: manifest)
+            let errors = ExtensionDiagnostics.activationErrors(context.errors, manifest: manifest)
             guard errors.isEmpty else { throw Failure(ExtensionDiagnostics.describe(errors)) }
             if candidates[path] === context { candidates[path] = nil }
             return context
@@ -1095,6 +1101,16 @@ import WebKit
 
     // MARK: WKWebExtensionControllerDelegate
 
+    /// Vane runs no native host, so every message fails. Unimplemented, WebKit would never
+    /// answer at all, leaving callers waiting forever; answering at once makes polling loops
+    /// spin. The pause keeps them at roughly the pace a real host would set.
+    func webExtensionController(_ controller: WKWebExtensionController, sendMessage message: Any,
+                                toApplicationWithIdentifier applicationIdentifier: String?,
+                                for extensionContext: WKWebExtensionContext) async throws -> Any? {
+        try await Task.sleep(for: ExtensionDiagnostics.nativeMessageFailureDelay)
+        throw Failure("Vane does not connect extensions to native applications.")
+    }
+
     func webExtensionController(_ controller: WKWebExtensionController,
                                 openWindowsFor context: WKWebExtensionContext) -> [any WKWebExtensionWindow] {
         myStores
@@ -1230,8 +1246,7 @@ import WebKit
                                 promptForPermissions permissions: Set<WKWebExtension.Permission>,
                                 in tab: (any WKWebExtensionTab)?,
                                 for context: WKWebExtensionContext) async -> (Set<WKWebExtension.Permission>, Date?) {
-        let supported = permissions.filter { !ExtensionDiagnostics.unsupportedPermissions.contains($0.rawValue) }
-        return ask(context, supported.map(\.rawValue)) ? (supported, nil) : ([], nil)
+        ask(context, permissions.map(\.rawValue)) ? (permissions, nil) : ([], nil)
     }
 
     func webExtensionController(_ controller: WKWebExtensionController,

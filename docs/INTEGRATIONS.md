@@ -124,8 +124,9 @@ Pinned section, or a non-leading Split View pane. Activating those tabs remains 
 
 Vane does not provide native messaging hosts, replacement browser pages, extension side
 panels, developer-tools panels, omnibox keywords, or Chrome OAuth integration. Native
-messaging has public WebKit hooks, but Vane has no approved host-execution mechanism.
-ZIP/native-host feasibility, exact upstream package provenance, regression scope, and
+messaging has public WebKit hooks, but Vane has no approved host-execution mechanism:
+`runtime.connectNative` is unavailable, and `runtime.sendNativeMessage` fails after a short
+pause, so Safari builds that poll their own app keep running without it. ZIP/native-host feasibility, exact upstream package provenance, regression scope, and
 assembled-app results are in [Extension validation](EXTENSION-VALIDATION.md). No Vane
 backend or account is required.
 

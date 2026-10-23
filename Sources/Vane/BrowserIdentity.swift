@@ -16,6 +16,10 @@ enum BrowserIdentity {
             system: ProcessInfo.processInfo.operatingSystemVersion) + suffix
     }()
 
+    /// `safari` after WebKit's own "(KHTML, like Gecko) ", for web views that take
+    /// `applicationNameForUserAgent` rather than a full custom user agent.
+    static let applicationName = "Version/" + safari.dropFirst(prefix.count)
+
     /// Safari can update separately from macOS. If its metadata is unavailable,
     /// Safari and macOS share the same version numbering on our macOS 26+ target.
     static func safariVersion(installed: String?, system: OperatingSystemVersion) -> String {

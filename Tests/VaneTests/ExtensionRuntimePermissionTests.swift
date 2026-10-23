@@ -151,7 +151,7 @@ import XCTest
         XCTAssertTrue(ExtensionConsent.saved(for: folder, profileID: profile)!.isEmpty)
     }
 
-    func testUnsupportedHostCapabilitiesAreDisclosedAndCannotBeGranted() async throws {
+    func testUnsupportedHostCapabilitiesAreDisclosedAndNativeMessagesFail() async throws {
         try Data(#"{"manifest_version":3,"name":"Unsupported Fixture","version":"1.0","permissions":["downloads","nativeMessaging","contextMenus"],"options_ui":{"page":"options.html"},"commands":{"fixture":{"suggested_key":{"default":"Ctrl+Shift+Y"},"description":"Fixture shortcut"}}}"#.utf8)
             .write(to: folder.appendingPathComponent("manifest.json"))
         let host = ExtensionHost.host(for: profile)
@@ -164,13 +164,17 @@ import XCTest
             return true
         }
         let context = try XCTUnwrap(host.installed.first)
-        XCTAssertFalse(context.hasPermission(WKWebExtension.Permission(rawValue: "nativeMessaging")))
         let web = try await options(context)
-        let hidden = try await web.evaluateJavaScript("typeof browser.runtime.sendNativeMessage + ':' + typeof browser.contextMenus")
-        XCTAssertEqual(hidden as? String, "undefined:object")
-        let (granted, _) = await host.webExtensionController(host.controller,
-            promptForPermissions: [WKWebExtension.Permission(rawValue: "nativeMessaging")], in: nil, for: context)
-        XCTAssertTrue(granted.isEmpty)
+        let exposed = try await web.evaluateJavaScript("typeof browser.runtime.sendNativeMessage + ':' + typeof browser.runtime.connectNative + ':' + typeof browser.contextMenus")
+        XCTAssertEqual(exposed as? String, "function:undefined:object")
+        // Safari builds poll their app through this call; it must fail, and not instantly.
+        let started = ContinuousClock.now
+        let outcome = try await web.callAsyncJavaScript("""
+            try { await browser.runtime.sendNativeMessage('com.example.host', {command: 'sleep'}); return 'answered'; }
+            catch (error) { return 'failed'; }
+            """, arguments: [:], in: nil, contentWorld: .page) as? String
+        XCTAssertEqual(outcome, "failed")
+        XCTAssertGreaterThanOrEqual(ContinuousClock.now - started, ExtensionDiagnostics.nativeMessageFailureDelay)
     }
 
 }

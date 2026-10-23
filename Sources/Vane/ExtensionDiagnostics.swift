@@ -3,10 +3,14 @@ import WebKit
 
 /// Folder validation and host limitations, independent of installation consent.
 @MainActor enum ExtensionDiagnostics {
-    static let unsupportedAPIs: Set<String> = [
-        "browser.runtime.sendNativeMessage", "browser.runtime.connectNative"
-    ]
-    static let unsupportedPermissions: Set<String> = ["nativeMessaging"]
+    /// `sendNativeMessage` stays available and fails (see `ExtensionHost`): Safari builds call
+    /// it unconditionally, and a missing function turns their polling into a busy loop.
+    static let unsupportedAPIs: Set<String> = ["browser.runtime.connectNative"]
+
+    /// How long a native message waits before failing. Safari's own hosts answer after doing
+    /// work, and some extensions (Bitwarden's vault-timeout check) poll in a loop paced only
+    /// by that answer.
+    static let nativeMessageFailureDelay: Duration = .seconds(1)
 
     static func limitations(_ manifest: [String: Any], extension ext: WKWebExtension) -> [String] {
         let recognized = Set(ext.requestedPermissions.union(ext.optionalPermissions).map(\.rawValue))
@@ -16,9 +20,8 @@ import WebKit
         var issues = declared.subtracting(recognized).sorted().map {
             "\($0): this WebKit version does not recognize this capability."
         }
-        for permission in declared.intersection(unsupportedPermissions).sorted() {
-            issues.append("\(permission): Vane does not provide " + (permission == "nativeMessaging"
-                ? "connections to native messaging hosts." : "extension items in page menus."))
+        if declared.contains("nativeMessaging") {
+            issues.append("nativeMessaging: Vane does not connect extensions to native applications; their messages fail.")
         }
         if !declared.intersection(["contextMenus", "menus"]).isEmpty {
             issues.append("Page menus are supported; Vane does not yet add extension items to sidebar tab menus.")
@@ -43,6 +46,21 @@ import WebKit
             return !(manifest["description"] == nil && value.domain == WKWebExtension.errorDomain
                 && value.code == WKWebExtension.Error.invalidManifestEntry.rawValue
                 && value.localizedDescription.contains("`description`"))
+        }
+    }
+
+    /// An exception the background script threw and nothing caught. WebKit records it in the
+    /// context domain with a code past the public enum. Browsers keep such an extension
+    /// running, and some are expected: Bitwarden's Safari build subscribes to a notification
+    /// stream that only ever errors, because Safari has no `notifications` API either.
+    static let uncaughtScriptErrorCode = 7
+
+    /// `blockingErrors` minus uncaught script errors: those stay visible in the manager but
+    /// do not stop activation.
+    static func activationErrors(_ errors: [any Error], manifest: [String: Any]) -> [any Error] {
+        blockingErrors(errors, manifest: manifest).filter { error in
+            let value = error as NSError
+            return !(value.domain == WKWebExtensionContext.errorDomain && value.code == uncaughtScriptErrorCode)
         }
     }
 
